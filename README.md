@@ -18,7 +18,7 @@ A primitive that turns any protocol into its own protection layer.
 - Most protocols have no answer for "what if we get hacked?"
 - External coverage (Nexus Mutual) requires premiums that leave your ecosystem
 - Token emissions to cover losses = slow rug via dilution
-- Discretionary claim committees decide if you "deserve" a payout
+- Discretionary claim committees decide if you receive a payout
 
 **The Solution:**
 - A seed that grows from normal transaction flow
@@ -69,7 +69,7 @@ A primitive that turns any protocol into its own protection layer.
 │   1. Oracle detects exploit/failure                             │
 │   2. Proposes trigger to contract                               │
 │   3. Multi-sig confirms (1-24hr window)                         │
-│   4. Seed releases up to 50%                                    │
+│   4. Seed releases up to 50%*                                    │
 │   5. Users claim pro-rata shares                                │
 │   6. Unclaimed returns to seed after 30 days                    │
 │   7. Seed rebuilds from ongoing deposits                        │
