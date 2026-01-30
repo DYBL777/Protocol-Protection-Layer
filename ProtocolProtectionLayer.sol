@@ -4,16 +4,15 @@ pragma solidity ^0.8.20;
 /*
  * ╔══════════════════════════════════════════════════════════════════════════╗
  * ║                                                                          ║
- * ║                           SEED INSURANCE                                 ║
- * ║                     Eternal Seed Variant 8                               ║
- * ║                          VERSION 3.1                                     ║
+ * ║                    PROTOCOL PROTECTION LAYER (PPL)                       ║
+ * ║                         VERSION 2.0                                      ║
  * ║                                                                          ║
  * ╠══════════════════════════════════════════════════════════════════════════╣
  * ║                                                                          ║
  * ║  Licensed under the Business Source License 1.1 (BUSL-1.1)               ║
  * ║                                                                          ║
  * ║  Licensor:            DYBL Foundation                                    ║
- * ║  Licensed Work:       SeedInsurance & Eternal Seed Mechanism             ║
+ * ║  Licensed Work:       Protocol Protection Layer                          ║
  * ║  Change Date:         May 10, 2029                                       ║
  * ║  Change License:      MIT                                                ║
  * ║                                                                          ║
@@ -21,30 +20,42 @@ pragma solidity ^0.8.20;
  * ║                                                                          ║
  * ╚══════════════════════════════════════════════════════════════════════════╝
  *
- * @title SeedInsurance V3.1
+ * @title ProtocolProtectionLayer V2.0
  * @author DYBL Foundation
- * @notice Eternal Seed with native insurance payout capability for black swan events
- * 
- * @dev Core Mechanism:
- *      - Deposits are split: seedBps% → Aave (insurance reserve), remainder → yield pool
- *      - Seed compounds via Aave yield, creating a "rising floor"
- *      - On verified trigger: seed releases up to maxClaimBps% for pro-rata user claims
- *      - Seed rebuilds from ongoing deposits after claim period ends
+ * @notice Yield-funded embedded protection. Deposit, earn, withdraw anytime.
+ *
+ * @dev The Concept:
+ *      You came for yield. Protection is included.
+ *      
+ *      Like train tickets with delay compensation built in.
+ *      Like credit cards with purchase protection.
+ *      You didn't pay extra. It's just there.
+ *
+ * @dev How It Works:
+ *      1. User deposits USDC (or other token)
+ *      2. ALL funds go to Aave, earning yield
+ *      3. Yield is split: 80% user / 10% seed / 10% treasury
+ *      4. User can withdraw principal ANYTIME
+ *      5. If something goes wrong, seed compensates users automatically
+ *
+ * @dev The Split (configurable, example 80/10/10):
+ *      ┌─────────────────────────────────────────┐
+ *      │  Yield Generated                        │
+ *      │  ├── 80% → User (competitive return)    │
+ *      │  ├── 10% → Seed (protection fund)       │
+ *      │  └── 10% → Treasury (operations)        │
+ *      └─────────────────────────────────────────┘
+ *
+ * @dev Key Difference from V1:
+ *      V1: Seed funded from deposit principal (locked forever)
+ *      V2: Seed funded from yield only (principal stays liquid)
  *
  * @dev Security Features:
- *      - Front-run protection via block-anchored snapshots
- *      - Trigger governance: Oracle proposes, multi-sig confirms within time window
- *      - Dormancy mechanism: 90-day inactivity enables user fund recovery
- *      - Cooldown between claims prevents cascade drain attacks
- *
- * @dev V3.1 Changes:
- *      - Added heartbeat() function to reset dormancy timer
- *      - Dynamic MIN_DEPOSIT derived from token decimals (supports any ERC20)
- *
- * @dev Key Invariant:
- *      The seed principal can only exit via:
- *      1. Approved insurance claim (up to maxClaimBps per event)
- *      2. Dormancy withdrawal (after 90 days of protocol inactivity)
+ *      - Front-run protection via deposit halt during trigger evaluation
+ *      - Block-anchored snapshots for compensation eligibility
+ *      - Trigger governance: Oracle proposes, multi-sig confirms
+ *      - Dormancy mechanism: 90-day inactivity enables full exit
+ *      - Cooldown between compensation events prevents drain
  *
  * @custom:security-contact dybl7@proton.me
  */
@@ -57,379 +68,214 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@aave/core-v3/contracts/interfaces/IPool.sol";
 
-contract SeedInsuranceV3 is Ownable2Step, ReentrancyGuard, Pausable {
+contract ProtocolProtectionLayerV2 is Ownable2Step, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
 
     /*//////////////////////////////////////////////////////////////
                             IMMUTABLES
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Token used for deposits (e.g., USDC, DAI, WBTC)
-    /// @dev Must be compatible with Aave V3 pool
     address public immutable DEPOSIT_TOKEN;
-
-    /// @notice Aave aToken received when supplying DEPOSIT_TOKEN
-    /// @dev Used to track seed value including accrued yield
     address public immutable A_TOKEN;
-
-    /// @notice Aave V3 Pool contract for supply/withdraw operations
     address public immutable AAVE_POOL;
-
-    /// @notice Minimum deposit amount to prevent dust attacks
-    /// @dev Derived from token decimals: 1 full token (e.g., 1e6 for USDC, 1e18 for DAI)
     uint256 public immutable MIN_DEPOSIT;
 
     /*//////////////////////////////////////////////////////////////
-                         SEED CONFIGURATION
+                         YIELD SPLIT CONFIG
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Percentage of deposits allocated to insurance seed
-    /// @dev Basis points (e.g., 1500 = 15%). Max 5000 (50%)
-    uint256 public seedBps;
+    /// @notice User's share of yield in basis points (e.g., 8000 = 80%)
+    uint256 public userYieldBps;
 
-    /// @notice Maximum percentage of seed claimable per insurance event
-    /// @dev Basis points (e.g., 5000 = 50%). Prevents full drain on single event
-    uint256 public maxClaimBps;
+    /// @notice Seed's share of yield in basis points (e.g., 1000 = 10%)
+    uint256 public seedYieldBps;
 
-    /// @notice Minimum time between claim trigger events
-    /// @dev Prevents cascade drain attacks via multiple rapid triggers
-    uint256 public cooldownPeriod;
+    /// @notice Treasury's share of yield in basis points (e.g., 1000 = 10%)
+    uint256 public treasuryYieldBps;
 
-    /// @notice Basis points denominator for percentage calculations
     uint256 public constant BPS_DENOMINATOR = 10000;
 
-    /// @notice Minimum allowed cooldown period
-    /// @dev 7 days provides time for incident assessment
-    uint256 public constant MIN_COOLDOWN = 7 days;
-
-    /// @notice Minimum claim window before endClaimPeriod can be called
-    /// @dev 30 days ensures users have adequate time to claim
-    uint256 public constant MIN_CLAIM_WINDOW = 30 days;
-
     /*//////////////////////////////////////////////////////////////
-                        DORMANCY CONFIGURATION
+                         PROTECTION CONFIG
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Timestamp of last meaningful protocol activity
-    /// @dev Updated by recordActivity modifier on key functions
+    /// @notice Maximum percentage of seed claimable per compensation event
+    uint256 public maxCompensationBps;
+
+    /// @notice Minimum time between compensation events
+    uint256 public cooldownPeriod;
+
+    uint256 public constant MIN_COOLDOWN = 7 days;
+    uint256 public constant MIN_COMPENSATION_WINDOW = 30 days;
+
+    /*//////////////////////////////////////////////////////////////
+                         DORMANCY CONFIG
+    //////////////////////////////////////////////////////////////*/
+
     uint256 public lastActivityTimestamp;
-
-    /// @notice Time without activity before dormancy can be activated
-    /// @dev 90 days balances safety with reasonable inactivity period
     uint256 public constant DORMANCY_THRESHOLD = 90 days;
-
-    /// @notice Whether dormancy mode has been activated
-    /// @dev Once true, deposits are disabled and withdrawals enabled
     bool public dormancyActivated;
-
-    /// @notice Tracks users who have completed dormancy withdrawal
-    /// @dev Prevents double-withdrawal during dormancy
-    mapping(address => bool) public hasDormancyWithdrawn;
 
     /*//////////////////////////////////////////////////////////////
                        TRIGGER GOVERNANCE
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Address authorized to propose claim triggers
-    /// @dev Intended for Chainlink Automation or similar oracle service
     address public triggerOracle;
-
-    /// @notice Address authorized to confirm proposed triggers
-    /// @dev Intended for multi-sig (e.g., Gnosis Safe 3-of-5)
     address public triggerMultisig;
 
-    /// @notice Trigger ID awaiting multi-sig confirmation
-    /// @dev bytes32(0) when no trigger is pending
     bytes32 public pendingTriggerId;
-
-    /// @notice Timestamp when current trigger was proposed
-    /// @dev Used to enforce confirmation window and minimum delay
     uint256 public triggerProposedAt;
 
-    /// @notice Maximum time for multi-sig to confirm after proposal
-    /// @dev Trigger expires if not confirmed within 24 hours
     uint256 public constant TRIGGER_CONFIRMATION_WINDOW = 24 hours;
-
-    /// @notice Minimum delay between proposal and confirmation
-    /// @dev 1 hour buffer allows cancellation if oracle is compromised
     uint256 public constant TRIGGER_MIN_DELAY = 1 hours;
+    uint256 public constant DEPOSIT_HALT_BUFFER = 1 minutes;
 
-    /*//////////////////////////////////////////////////////////////
-                           CLAIM STATE
-    //////////////////////////////////////////////////////////////*/
+    uint256 public depositsDisabledUntil;
 
-    /// @notice Registered trigger IDs that can initiate claims
-    /// @dev Triggers must be pre-registered by owner
     mapping(bytes32 => bool) public validTriggers;
 
-    /// @notice Timestamp of most recent claim trigger
-    /// @dev Used to enforce cooldown period
-    uint256 public lastClaimTimestamp;
+    /*//////////////////////////////////////////////////////////////
+                       COMPENSATION STATE
+    //////////////////////////////////////////////////////////////*/
 
-    /// @notice Whether a claim event is currently active
-    /// @dev When true, deposits blocked and users can claim
-    bool public claimActive;
+    uint256 public lastCompensationTimestamp;
+    bool public compensationActive;
+    uint256 public currentCompensationId;
 
-    /// @notice Incrementing ID for each claim event
-    /// @dev Used as key for claim-specific mappings
-    uint256 public currentClaimId;
+    mapping(uint256 => uint256) public compensationTriggerBlock;
+    mapping(uint256 => uint256) public compensationPoolAmounts;
+    mapping(uint256 => uint256) public totalSnapshotBalances;
+    mapping(uint256 => uint256) public compensatedAmounts;
+    mapping(uint256 => mapping(address => bool)) public hasCompensated;
 
     /*//////////////////////////////////////////////////////////////
                          BALANCE TRACKING
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Cumulative deposit balance per user
-    /// @dev Used for pro-rata claim calculations. Never decreases in normal operation
-    mapping(address => uint256) public userBalances;
+    /// @notice User's deposited principal
+    mapping(address => uint256) public userPrincipal;
 
-    /// @notice Sum of all user balances
-    /// @dev Denominator for pro-rata calculations
-    uint256 public totalUserBalances;
+    /// @notice User's yield already claimed
+    mapping(address => uint256) public userYieldClaimed;
 
-    /// @notice Block number of each user's most recent deposit
-    /// @dev Front-run protection: must be < trigger block to claim
+    /// @notice Block of user's last deposit (for front-run protection)
     mapping(address => uint256) public lastDepositBlock;
 
-    /// @notice Block number when each claim was triggered
-    /// @dev Anchor for front-run protection comparison
-    mapping(uint256 => uint256) public claimTriggerBlock;
-
-    /// @notice Snapshot of totalUserBalances at each claim trigger
-    /// @dev Locked at trigger time to prevent manipulation
-    mapping(uint256 => uint256) public totalSnapshotBalances;
-
-    /// @notice Total tokens available for each claim event
-    /// @dev Calculated as seedValue * maxClaimBps / BPS_DENOMINATOR
-    mapping(uint256 => uint256) public claimPoolAmounts;
-
-    /// @notice Running total of tokens claimed per event
-    /// @dev Used to calculate unclaimed remainder for return to seed
-    mapping(uint256 => uint256) public claimedAmounts;
-
-    /// @notice Tracks whether user has claimed for specific event
-    /// @dev Prevents double-claiming within same event
-    mapping(uint256 => mapping(address => bool)) public hasClaimed;
+    /// @notice Total principal deposited by all users
+    uint256 public totalPrincipal;
 
     /*//////////////////////////////////////////////////////////////
-                          ACCOUNTING
+                            ACCOUNTING
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Cumulative principal deposited to Aave seed
-    /// @dev Does not include accrued yield
-    uint256 public totalSeeded;
+    /// @notice Protection seed balance (stays in Aave)
+    uint256 public seedBalance;
 
-    /// @notice Cumulative tokens received in yield pool
-    /// @dev Portion of deposits not sent to seed
-    uint256 public totalYieldReceived;
+    /// @notice Treasury balance available for withdrawal
+    uint256 public treasuryBalance;
 
-    /// @notice Cumulative tokens distributed from yield pool
-    /// @dev For operational costs, rewards, etc.
-    uint256 public totalYieldDistributed;
+    /// @notice Total user yield distributed (for pro-rata calculation)
+    uint256 public totalUserYieldDistributed;
 
-    /// @notice Cumulative tokens paid via insurance claims
-    /// @dev Across all claim events
-    uint256 public totalClaimsPaid;
+    /// @notice Total yield sent to seed
+    uint256 public totalSeedYieldReceived;
 
-    /// @notice Cumulative tokens withdrawn via dormancy
-    /// @dev Only populated if dormancy activates
+    /// @notice Total yield sent to treasury
+    uint256 public totalTreasuryYieldReceived;
+
+    /// @notice Total compensation paid out
+    uint256 public totalCompensationPaid;
+
+    /*//////////////////////////////////////////////////////////////
+                         DORMANCY TRACKING
+    //////////////////////////////////////////////////////////////*/
+
+    mapping(address => bool) public hasDormancyWithdrawn;
     uint256 public totalDormancyWithdrawn;
 
     /*//////////////////////////////////////////////////////////////
                               EVENTS
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Emitted when user deposits tokens
-    /// @param user Depositor address
-    /// @param amount Total deposit amount
-    /// @param toSeed Portion allocated to insurance seed
-    /// @param toYield Portion allocated to yield pool
-    event Deposited(address indexed user, uint256 amount, uint256 toSeed, uint256 toYield);
+    event Deposited(address indexed user, uint256 amount);
+    event Withdrawn(address indexed user, uint256 amount);
+    event YieldHarvested(uint256 totalYield, uint256 toUsers, uint256 toSeed, uint256 toTreasury);
+    event YieldClaimed(address indexed user, uint256 amount);
+    event TreasuryWithdrawn(address indexed to, uint256 amount);
 
-    /// @notice Emitted when tokens are supplied to Aave seed
-    /// @param amount Tokens supplied this transaction
-    /// @param totalSeeded Cumulative seed principal after supply
-    event Seeded(uint256 amount, uint256 totalSeeded);
-
-    /// @notice Emitted when new trigger is registered
-    /// @param triggerId Unique identifier for the trigger
-    /// @param description Human-readable trigger description
     event TriggerAdded(bytes32 indexed triggerId, string description);
-
-    /// @notice Emitted when trigger is deregistered
-    /// @param triggerId Trigger being removed
     event TriggerRemoved(bytes32 indexed triggerId);
-
-    /// @notice Emitted when oracle proposes a trigger
-    /// @param triggerId Proposed trigger ID
-    /// @param oracle Address that proposed (triggerOracle)
-    /// @param proposedAt Block timestamp of proposal
     event TriggerProposed(bytes32 indexed triggerId, address indexed oracle, uint256 proposedAt);
-
-    /// @notice Emitted when multi-sig confirms trigger
-    /// @param triggerId Confirmed trigger ID
-    /// @param multisig Address that confirmed (triggerMultisig)
     event TriggerConfirmed(bytes32 indexed triggerId, address indexed multisig);
-
-    /// @notice Emitted when pending trigger is cancelled
-    /// @param triggerId Cancelled trigger ID
     event TriggerCancelled(bytes32 indexed triggerId);
+    event DepositsHalted(uint256 until);
+    event DepositHaltCleared();
 
-    /// @notice Emitted when claim event is triggered
-    /// @param claimId Unique ID for this claim event
-    /// @param triggerId Trigger that initiated the claim
-    /// @param claimableAmount Total tokens available for claims
-    /// @param triggerBlock Block number at trigger time
-    event ClaimTriggered(uint256 indexed claimId, bytes32 triggerId, uint256 claimableAmount, uint256 triggerBlock);
+    event CompensationTriggered(uint256 indexed compensationId, bytes32 triggerId, uint256 amount, uint256 triggerBlock);
+    event CompensationPaid(uint256 indexed compensationId, address indexed user, uint256 amount);
+    event CompensationPeriodEnded(uint256 indexed compensationId, uint256 totalPaid, uint256 returnedToSeed);
 
-    /// @notice Emitted when user claims their insurance payout
-    /// @param claimId Claim event ID
-    /// @param user Claimant address
-    /// @param amount Tokens paid to user
-    event ClaimPayout(uint256 indexed claimId, address indexed user, uint256 amount);
-
-    /// @notice Emitted when claim period ends
-    /// @param claimId Claim event ID
-    /// @param totalPaid Total tokens claimed by users
-    /// @param unclaimed Tokens returned to seed
-    event ClaimPeriodEnded(uint256 indexed claimId, uint256 totalPaid, uint256 unclaimed);
-
-    /// @notice Emitted when yield is distributed
-    /// @param to Recipient address
-    /// @param amount Tokens distributed
-    event YieldDistributed(address indexed to, uint256 amount);
-
-    /// @notice Emitted when configuration is updated
-    /// @param seedBps New seed percentage
-    /// @param maxClaimBps New max claim percentage
-    /// @param cooldownPeriod New cooldown period
-    event ConfigUpdated(uint256 seedBps, uint256 maxClaimBps, uint256 cooldownPeriod);
-
-    /// @notice Emitted when trigger governance addresses updated
-    /// @param oracle New oracle address
-    /// @param multisig New multi-sig address
+    event ConfigUpdated(uint256 userBps, uint256 seedBps, uint256 treasuryBps, uint256 maxCompBps, uint256 cooldown);
     event GovernanceUpdated(address indexed oracle, address indexed multisig);
 
-    /// @notice Emitted when dormancy mode activates
-    /// @param timestamp Activation time
-    /// @param totalAssets Total tokens available for withdrawal
     event DormancyActivated(uint256 timestamp, uint256 totalAssets);
-
-    /// @notice Emitted when user withdraws via dormancy
-    /// @param user Withdrawer address
-    /// @param amount Tokens withdrawn
     event DormancyWithdrawal(address indexed user, uint256 amount);
-
-    /// @notice Emitted when activity timestamp updates
-    /// @param timestamp New activity timestamp
-    event ActivityRecorded(uint256 timestamp);
-
-    /// @notice Emitted when heartbeat is called
-    /// @param timestamp Heartbeat timestamp
     event Heartbeat(uint256 timestamp);
+    event ActivityRecorded(uint256 timestamp);
 
     /*//////////////////////////////////////////////////////////////
                               ERRORS
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Thrown when address parameter is zero
     error InvalidAddress();
-
-    /// @notice Thrown when amount parameter is zero
     error InvalidAmount();
-
-    /// @notice Thrown when deposit is below MIN_DEPOSIT
     error DepositTooSmall();
-
-    /// @notice Thrown when operation blocked due to active claim
-    error ClaimInProgress();
-
-    /// @notice Thrown when claim operation attempted with no active claim
-    error NoActiveClaim();
-
-    /// @notice Thrown when user attempts to claim twice for same event
-    error AlreadyClaimed();
-
-    /// @notice Thrown when user has no balance to claim against
-    error NoBalance();
-
-    /// @notice Thrown when calculated share rounds to zero
-    error ShareTooSmall();
-
-    /// @notice Thrown when trigger ID is invalid or unregistered
-    error InvalidTrigger();
-
-    /// @notice Thrown when adding trigger that already exists
-    error TriggerExists();
-
-    /// @notice Thrown when removing trigger that doesn't exist
-    error TriggerNotFound();
-
-    /// @notice Thrown when cooldown period hasn't elapsed
-    error CooldownNotElapsed();
-
-    /// @notice Thrown when claim window hasn't elapsed
-    error ClaimWindowNotElapsed();
-
-    /// @notice Thrown when seed has no value to claim against
-    error NoSeedToClaim();
-
-    /// @notice Thrown when yield distribution exceeds available balance
+    error InsufficientBalance();
     error InsufficientYield();
-
-    /// @notice Thrown when attempting to recover protected aToken
-    error CannotTouchSeed();
-
-    /// @notice Thrown when user deposited at or after trigger block
+    error CompensationInProgress();
+    error NoActiveCompensation();
+    error AlreadyCompensated();
+    error NoBalance();
+    error ShareTooSmall();
+    error InvalidTrigger();
+    error TriggerExists();
+    error TriggerNotFound();
+    error CooldownNotElapsed();
+    error CompensationWindowNotElapsed();
+    error NoSeedToCompensate();
     error DepositedAfterTrigger();
-
-    /// @notice Thrown when config parameter out of allowed range
     error ConfigOutOfRange();
-
-    /// @notice Thrown when non-oracle calls oracle-only function
     error NotOracle();
-
-    /// @notice Thrown when non-multisig calls multisig-only function
     error NotMultisig();
-
-    /// @notice Thrown when confirming with no pending trigger
     error NoPendingTrigger();
-
-    /// @notice Thrown when trigger confirmation window has passed
     error TriggerExpired();
-
-    /// @notice Thrown when confirming before minimum delay
     error TriggerTooEarly();
-
-    /// @notice Thrown when dormancy action attempted but not dormant
     error NotDormant();
-
-    /// @notice Thrown when dormancy withdrawal attempted before activation
     error DormancyNotActivated();
-
-    /// @notice Thrown when user attempts second dormancy withdrawal
     error AlreadyDormancyWithdrawn();
-
-    /// @notice Thrown when deposit attempted after dormancy activation
-    error ProtocolStillActive();
+    error ProtocolDormant();
+    error DepositsTemporarilyHalted();
+    error NoETHAccepted();
+    error SplitMustEqual100();
+    error InsufficientAaveLiquidity();
+    error InsufficientContractBalance();
+    error NoYieldToHarvest();
+    error ExceedsDormancyTxCap();
 
     /*//////////////////////////////////////////////////////////////
                             MODIFIERS
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Restricts function to triggerOracle address
     modifier onlyOracle() {
         if (msg.sender != triggerOracle) revert NotOracle();
         _;
     }
 
-    /// @notice Restricts function to triggerMultisig address
     modifier onlyMultisig() {
         if (msg.sender != triggerMultisig) revert NotMultisig();
         _;
     }
 
-    /// @notice Updates lastActivityTimestamp to current block
-    /// @dev Applied to functions that represent meaningful protocol activity
     modifier recordActivity() {
         lastActivityTimestamp = block.timestamp;
         emit ActivityRecorded(block.timestamp);
@@ -440,24 +286,16 @@ contract SeedInsuranceV3 is Ownable2Step, ReentrancyGuard, Pausable {
                             CONSTRUCTOR
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Deploys SeedInsurance V3.1 contract
-    /// @param _depositToken ERC20 token for deposits (e.g., USDC, DAI, WBTC)
-    /// @param _aToken Corresponding Aave aToken (e.g., aUSDC)
-    /// @param _aavePool Aave V3 Pool contract address
-    /// @param _seedBps Percentage of deposits to seed (basis points, max 5000)
-    /// @param _maxClaimBps Maximum claimable per event (basis points, max 5000)
-    /// @param _cooldownPeriod Minimum seconds between claim events
-    /// @param _triggerOracle Address authorized to propose triggers
-    /// @param _triggerMultisig Address authorized to confirm triggers
-    /// @dev All addresses must be non-zero. Config values must be within ranges.
-    ///      MIN_DEPOSIT is automatically derived from token decimals.
+    /// @notice Deploy PPL V2
+    /// @param _depositToken Token for deposits (e.g., USDC)
+    /// @param _aToken Corresponding Aave aToken
+    /// @param _aavePool Aave V3 Pool address
+    /// @param _triggerOracle Address that can propose triggers
+    /// @param _triggerMultisig Address that confirms triggers
     constructor(
         address _depositToken,
         address _aToken,
         address _aavePool,
-        uint256 _seedBps,
-        uint256 _maxClaimBps,
-        uint256 _cooldownPeriod,
         address _triggerOracle,
         address _triggerMultisig
     ) Ownable(msg.sender) {
@@ -466,34 +304,217 @@ contract SeedInsuranceV3 is Ownable2Step, ReentrancyGuard, Pausable {
         if (_aavePool == address(0)) revert InvalidAddress();
         if (_triggerOracle == address(0)) revert InvalidAddress();
         if (_triggerMultisig == address(0)) revert InvalidAddress();
-        if (_seedBps == 0 || _seedBps > 5000) revert ConfigOutOfRange();
-        if (_maxClaimBps == 0 || _maxClaimBps > 5000) revert ConfigOutOfRange();
-        if (_cooldownPeriod < MIN_COOLDOWN) revert ConfigOutOfRange();
 
         DEPOSIT_TOKEN = _depositToken;
         A_TOKEN = _aToken;
         AAVE_POOL = _aavePool;
-        seedBps = _seedBps;
-        maxClaimBps = _maxClaimBps;
-        cooldownPeriod = _cooldownPeriod;
         triggerOracle = _triggerOracle;
         triggerMultisig = _triggerMultisig;
-        
-        // Derive MIN_DEPOSIT from token decimals (1 full token)
+
+        // Default split: 80/10/10
+        userYieldBps = 8000;
+        seedYieldBps = 1000;
+        treasuryYieldBps = 1000;
+
+        // Default protection config
+        maxCompensationBps = 5000; // 50% of seed per event
+        cooldownPeriod = 7 days;
+
+        // Derive MIN_DEPOSIT from token decimals
         uint8 decimals = IERC20Metadata(_depositToken).decimals();
         MIN_DEPOSIT = 10 ** decimals;
-        
+
         lastActivityTimestamp = block.timestamp;
     }
 
     /*//////////////////////////////////////////////////////////////
-                         ADMIN: TRIGGERS
+                          ETH REJECTION
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Registers a new valid claim trigger
-    /// @param triggerId Unique identifier (e.g., keccak256("AAVE_EXPLOIT"))
-    /// @param description Human-readable description for documentation
-    /// @dev Only owner. Trigger must not already exist.
+    receive() external payable {
+        revert NoETHAccepted();
+    }
+
+    fallback() external payable {
+        revert NoETHAccepted();
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                          CORE: DEPOSIT
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Deposit tokens to earn yield with embedded protection
+    /// @param amount Amount to deposit
+    /// @dev All funds go to Aave. User can withdraw anytime.
+    function deposit(uint256 amount) external nonReentrant whenNotPaused recordActivity {
+        if (amount < MIN_DEPOSIT) revert DepositTooSmall();
+        if (dormancyActivated) revert ProtocolDormant();
+        if (compensationActive) revert CompensationInProgress();
+        if (block.timestamp < depositsDisabledUntil) revert DepositsTemporarilyHalted();
+
+        // Harvest any pending yield first
+        _harvestYield();
+
+        // Transfer from user
+        IERC20(DEPOSIT_TOKEN).safeTransferFrom(msg.sender, address(this), amount);
+
+        // Supply ALL to Aave
+        IERC20(DEPOSIT_TOKEN).forceApprove(AAVE_POOL, amount);
+        IPool(AAVE_POOL).supply(DEPOSIT_TOKEN, amount, address(this), 0);
+        IERC20(DEPOSIT_TOKEN).forceApprove(AAVE_POOL, 0);
+
+        // Track user principal
+        userPrincipal[msg.sender] += amount;
+        totalPrincipal += amount;
+        lastDepositBlock[msg.sender] = block.number;
+
+        emit Deposited(msg.sender, amount);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                          CORE: WITHDRAW
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Withdraw principal anytime
+    /// @param amount Amount to withdraw
+    /// @dev User can withdraw their principal whenever they want
+    function withdraw(uint256 amount) external nonReentrant recordActivity {
+        if (amount == 0) revert InvalidAmount();
+        if (dormancyActivated) revert ProtocolDormant();
+        if (compensationActive) revert CompensationInProgress();
+        
+        uint256 principal = userPrincipal[msg.sender];
+        if (amount > principal) revert InsufficientBalance();
+
+        // Harvest yield first
+        _harvestYield();
+
+        // Update state
+        userPrincipal[msg.sender] -= amount;
+        totalPrincipal -= amount;
+
+        // Withdraw from Aave
+        uint256 balanceBefore = IERC20(DEPOSIT_TOKEN).balanceOf(address(this));
+        IPool(AAVE_POOL).withdraw(DEPOSIT_TOKEN, amount, address(this));
+        uint256 received = IERC20(DEPOSIT_TOKEN).balanceOf(address(this)) - balanceBefore;
+        
+        // Check we got enough
+        if (received < amount) revert InsufficientAaveLiquidity();
+        
+        // Transfer to user
+        IERC20(DEPOSIT_TOKEN).safeTransfer(msg.sender, received);
+
+        emit Withdrawn(msg.sender, received);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                          YIELD MANAGEMENT
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Harvest and distribute yield (callable by anyone)
+    /// @dev Reverts if no yield to harvest (prevents spam)
+    function harvestYield() external nonReentrant recordActivity {
+        uint256 aTokenBalance = IERC20(A_TOKEN).balanceOf(address(this));
+        uint256 allocated = totalPrincipal + seedBalance + treasuryBalance;
+        if (aTokenBalance <= allocated) revert NoYieldToHarvest();
+        
+        _harvestYield();
+    }
+
+    /// @notice Internal yield harvesting
+    function _harvestYield() internal {
+        uint256 aTokenBalance = IERC20(A_TOKEN).balanceOf(address(this));
+        
+        // What we should have: principal + seed + treasury
+        uint256 allocated = totalPrincipal + seedBalance + treasuryBalance;
+        
+        // If aToken balance > allocated, we have yield
+        if (aTokenBalance <= allocated) return;
+        
+        uint256 totalYield = aTokenBalance - allocated;
+        if (totalYield == 0) return;
+
+        // Split yield according to config
+        uint256 toUsers = (totalYield * userYieldBps) / BPS_DENOMINATOR;
+        uint256 toSeed = (totalYield * seedYieldBps) / BPS_DENOMINATOR;
+        uint256 toTreasury = totalYield - toUsers - toSeed; // Remainder
+
+        // Track user yield (distributed pro-rata when claimed)
+        totalUserYieldDistributed += toUsers;
+
+        // Add to seed
+        seedBalance += toSeed;
+        totalSeedYieldReceived += toSeed;
+
+        // Add to treasury
+        treasuryBalance += toTreasury;
+        totalTreasuryYieldReceived += toTreasury;
+
+        emit YieldHarvested(totalYield, toUsers, toSeed, toTreasury);
+    }
+
+    /// @notice Claim accumulated yield
+    function claimYield() external nonReentrant recordActivity {
+        _harvestYield();
+        
+        uint256 claimable = getClaimableYield(msg.sender);
+        if (claimable == 0) revert InsufficientYield();
+
+        // Track claimed amount
+        userYieldClaimed[msg.sender] += claimable;
+
+        // Withdraw from Aave
+        uint256 balanceBefore = IERC20(DEPOSIT_TOKEN).balanceOf(address(this));
+        IPool(AAVE_POOL).withdraw(DEPOSIT_TOKEN, claimable, address(this));
+        uint256 received = IERC20(DEPOSIT_TOKEN).balanceOf(address(this)) - balanceBefore;
+        
+        // Check we got enough
+        if (received < claimable) revert InsufficientAaveLiquidity();
+        
+        // Transfer to user
+        IERC20(DEPOSIT_TOKEN).safeTransfer(msg.sender, received);
+
+        emit YieldClaimed(msg.sender, received);
+    }
+
+    /// @notice Get user's claimable yield
+    function getClaimableYield(address user) public view returns (uint256) {
+        if (totalPrincipal == 0) return 0;
+        if (userPrincipal[user] == 0) return 0;
+        
+        // User's share of total distributed yield
+        uint256 userShare = (totalUserYieldDistributed * userPrincipal[user]) / totalPrincipal;
+        
+        // Subtract what they've already claimed
+        uint256 claimed = userYieldClaimed[user];
+        
+        return userShare > claimed ? userShare - claimed : 0;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                       TREASURY WITHDRAWAL
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Withdraw from treasury
+    /// @param amount Amount to withdraw
+    /// @param to Recipient address
+    /// @dev In production, this function should be called via a timelock/multisig contract.
+    function withdrawTreasury(uint256 amount, address to) external onlyOwner nonReentrant {
+        if (to == address(0)) revert InvalidAddress();
+        if (amount > treasuryBalance) revert InsufficientBalance();
+        if (compensationActive) revert CompensationInProgress();
+
+        treasuryBalance -= amount;
+
+        IPool(AAVE_POOL).withdraw(DEPOSIT_TOKEN, amount, to);
+
+        emit TreasuryWithdrawn(to, amount);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                         TRIGGER MANAGEMENT
+    //////////////////////////////////////////////////////////////*/
+
     function addTrigger(bytes32 triggerId, string calldata description) external onlyOwner {
         if (triggerId == bytes32(0)) revert InvalidTrigger();
         if (validTriggers[triggerId]) revert TriggerExists();
@@ -502,9 +523,6 @@ contract SeedInsuranceV3 is Ownable2Step, ReentrancyGuard, Pausable {
         emit TriggerAdded(triggerId, description);
     }
 
-    /// @notice Deregisters an existing claim trigger
-    /// @param triggerId Trigger to remove
-    /// @dev Only owner. Trigger must exist. Does not affect pending triggers.
     function removeTrigger(bytes32 triggerId) external onlyOwner {
         if (!validTriggers[triggerId]) revert TriggerNotFound();
         
@@ -513,141 +531,22 @@ contract SeedInsuranceV3 is Ownable2Step, ReentrancyGuard, Pausable {
     }
 
     /*//////////////////////////////////////////////////////////////
-                        ADMIN: CONFIGURATION
+                       TRIGGER GOVERNANCE
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Updates seed configuration parameters
-    /// @param _seedBps New seed percentage (1-5000 basis points)
-    /// @param _maxClaimBps New max claim percentage (1-5000 basis points)
-    /// @param _cooldownPeriod New cooldown period (minimum 7 days)
-    /// @dev Only owner. Should be behind timelock in production deployment.
-    function updateConfig(
-        uint256 _seedBps,
-        uint256 _maxClaimBps,
-        uint256 _cooldownPeriod
-    ) external onlyOwner {
-        if (_seedBps == 0 || _seedBps > 5000) revert ConfigOutOfRange();
-        if (_maxClaimBps == 0 || _maxClaimBps > 5000) revert ConfigOutOfRange();
-        if (_cooldownPeriod < MIN_COOLDOWN) revert ConfigOutOfRange();
-        
-        seedBps = _seedBps;
-        maxClaimBps = _maxClaimBps;
-        cooldownPeriod = _cooldownPeriod;
-        
-        emit ConfigUpdated(_seedBps, _maxClaimBps, _cooldownPeriod);
-    }
-
-    /// @notice Updates trigger governance addresses
-    /// @param _triggerOracle New oracle address (e.g., Chainlink Automation)
-    /// @param _triggerMultisig New multi-sig address
-    /// @dev Only owner. Both addresses must be non-zero.
-    function updateGovernance(
-        address _triggerOracle,
-        address _triggerMultisig
-    ) external onlyOwner {
-        if (_triggerOracle == address(0)) revert InvalidAddress();
-        if (_triggerMultisig == address(0)) revert InvalidAddress();
-        
-        triggerOracle = _triggerOracle;
-        triggerMultisig = _triggerMultisig;
-        
-        emit GovernanceUpdated(_triggerOracle, _triggerMultisig);
-    }
-
-    /*//////////////////////////////////////////////////////////////
-                          ADMIN: PAUSE
-    //////////////////////////////////////////////////////////////*/
-
-    /// @notice Pauses deposit functionality
-    /// @dev Only owner. Use if Aave or yield source shows issues.
-    function pause() external onlyOwner {
-        _pause();
-    }
-
-    /// @notice Unpauses deposit functionality
-    /// @dev Only owner.
-    function unpause() external onlyOwner {
-        _unpause();
-    }
-
-    /*//////////////////////////////////////////////////////////////
-                        ADMIN: HEARTBEAT
-    //////////////////////////////////////////////////////////////*/
-
-    /// @notice Resets dormancy timer without any state changes
-    /// @dev Only owner. Call periodically (e.g., every 60 days) if protocol
-    ///      is healthy but has low deposit activity to prevent unintended dormancy.
-    function heartbeat() external onlyOwner {
-        lastActivityTimestamp = block.timestamp;
-        emit Heartbeat(block.timestamp);
-    }
-
-    /*//////////////////////////////////////////////////////////////
-                          CORE: DEPOSITS
-    //////////////////////////////////////////////////////////////*/
-
-    /// @notice Deposits tokens, splitting between seed and yield pool
-    /// @param amount Amount of DEPOSIT_TOKEN to deposit
-    /// @dev Caller must approve this contract first.
-    ///      Blocked when: paused, claim active, or dormancy activated.
-    ///      Records block number for front-run protection.
-    function deposit(uint256 amount) external nonReentrant whenNotPaused recordActivity {
-        if (amount < MIN_DEPOSIT) revert DepositTooSmall();
-        if (claimActive) revert ClaimInProgress();
-        if (dormancyActivated) revert ProtocolStillActive();
-        
-        IERC20(DEPOSIT_TOKEN).safeTransferFrom(msg.sender, address(this), amount);
-        
-        uint256 seedAmount = (amount * seedBps) / BPS_DENOMINATOR;
-        uint256 yieldAmount = amount - seedAmount;
-        
-        userBalances[msg.sender] += amount;
-        totalUserBalances += amount;
-        lastDepositBlock[msg.sender] = block.number;
-        
-        if (seedAmount > 0) {
-            IERC20(DEPOSIT_TOKEN).forceApprove(AAVE_POOL, seedAmount);
-            
-            try IPool(AAVE_POOL).supply(DEPOSIT_TOKEN, seedAmount, address(this), 0) {
-                totalSeeded += seedAmount;
-                emit Seeded(seedAmount, totalSeeded);
-            } catch {
-                // Aave supply failed, redirect to yield pool
-                yieldAmount += seedAmount;
-            }
-            
-            IERC20(DEPOSIT_TOKEN).forceApprove(AAVE_POOL, 0);
-        }
-        
-        totalYieldReceived += yieldAmount;
-        
-        emit Deposited(msg.sender, amount, seedAmount, yieldAmount);
-    }
-
-    /*//////////////////////////////////////////////////////////////
-                    TRIGGER GOVERNANCE: PROPOSE
-    //////////////////////////////////////////////////////////////*/
-
-    /// @notice Proposes a claim trigger for multi-sig confirmation
-    /// @param triggerId Registered trigger ID that was detected
-    /// @dev Only triggerOracle (e.g., Chainlink Automation).
-    ///      Creates pending trigger that multi-sig must confirm within 24h.
-    ///      Cannot propose if: claim active, cooldown not elapsed, or trigger invalid.
     function proposeTrigger(bytes32 triggerId) external onlyOracle {
         if (!validTriggers[triggerId]) revert InvalidTrigger();
-        if (claimActive) revert ClaimInProgress();
-        if (block.timestamp < lastClaimTimestamp + cooldownPeriod) revert CooldownNotElapsed();
+        if (compensationActive) revert CompensationInProgress();
+        if (block.timestamp < lastCompensationTimestamp + cooldownPeriod) revert CooldownNotElapsed();
         
         pendingTriggerId = triggerId;
         triggerProposedAt = block.timestamp;
+        depositsDisabledUntil = block.timestamp + TRIGGER_CONFIRMATION_WINDOW + DEPOSIT_HALT_BUFFER;
         
         emit TriggerProposed(triggerId, msg.sender, block.timestamp);
+        emit DepositsHalted(depositsDisabledUntil);
     }
 
-    /// @notice Confirms pending trigger and initiates claim event
-    /// @dev Only triggerMultisig.
-    ///      Must be called between TRIGGER_MIN_DELAY and TRIGGER_CONFIRMATION_WINDOW.
-    ///      Executes the claim trigger on success.
     function confirmTrigger() external onlyMultisig nonReentrant recordActivity {
         if (pendingTriggerId == bytes32(0)) revert NoPendingTrigger();
         if (block.timestamp < triggerProposedAt + TRIGGER_MIN_DELAY) revert TriggerTooEarly();
@@ -659,12 +558,9 @@ contract SeedInsuranceV3 is Ownable2Step, ReentrancyGuard, Pausable {
         
         emit TriggerConfirmed(triggerId, msg.sender);
         
-        _executeTrigger(triggerId);
+        _executeCompensation(triggerId);
     }
 
-    /// @notice Cancels a pending trigger
-    /// @dev Callable by owner or triggerMultisig.
-    ///      Use if oracle proposed incorrect trigger or situation resolved.
     function cancelTrigger() external {
         if (msg.sender != owner() && msg.sender != triggerMultisig) revert NotMultisig();
         if (pendingTriggerId == bytes32(0)) revert NoPendingTrigger();
@@ -672,357 +568,306 @@ contract SeedInsuranceV3 is Ownable2Step, ReentrancyGuard, Pausable {
         bytes32 triggerId = pendingTriggerId;
         pendingTriggerId = bytes32(0);
         triggerProposedAt = 0;
+        depositsDisabledUntil = 0;
         
         emit TriggerCancelled(triggerId);
+        emit DepositHaltCleared();
     }
 
-    /// @notice Internal function to execute trigger and initiate claim
-    /// @param triggerId The trigger being executed
-    /// @dev Withdraws maxClaimBps% from Aave, sets up claim state
-    function _executeTrigger(bytes32 triggerId) internal {
-        uint256 seedValue = IERC20(A_TOKEN).balanceOf(address(this));
-        if (seedValue == 0) revert NoSeedToClaim();
+    function _executeCompensation(bytes32 triggerId) internal {
+        // Harvest any pending yield first
+        _harvestYield();
         
-        uint256 claimableAmount = (seedValue * maxClaimBps) / BPS_DENOMINATOR;
+        if (seedBalance == 0) revert NoSeedToCompensate();
         
-        IPool(AAVE_POOL).withdraw(DEPOSIT_TOKEN, claimableAmount, address(this));
+        // Calculate compensation amount (up to maxCompensationBps of seed)
+        uint256 compensationAmount = (seedBalance * maxCompensationBps) / BPS_DENOMINATOR;
         
-        currentClaimId++;
-        claimActive = true;
-        lastClaimTimestamp = block.timestamp;
+        // Deduct from seed
+        seedBalance -= compensationAmount;
         
-        totalSnapshotBalances[currentClaimId] = totalUserBalances;
-        claimPoolAmounts[currentClaimId] = claimableAmount;
-        claimTriggerBlock[currentClaimId] = block.number;
+        // Withdraw from Aave to contract for distribution
+        uint256 balanceBefore = IERC20(DEPOSIT_TOKEN).balanceOf(address(this));
+        IPool(AAVE_POOL).withdraw(DEPOSIT_TOKEN, compensationAmount, address(this));
+        uint256 received = IERC20(DEPOSIT_TOKEN).balanceOf(address(this)) - balanceBefore;
         
-        emit ClaimTriggered(currentClaimId, triggerId, claimableAmount, block.number);
+        // Check we got at least 95% (allow small slippage)
+        uint256 minExpected = (compensationAmount * 95) / 100;
+        if (received < minExpected) revert InsufficientAaveLiquidity();
+        
+        // Set up compensation state (use actual received amount)
+        currentCompensationId++;
+        compensationActive = true;
+        lastCompensationTimestamp = block.timestamp;
+        
+        compensationTriggerBlock[currentCompensationId] = block.number;
+        compensationPoolAmounts[currentCompensationId] = received;
+        totalSnapshotBalances[currentCompensationId] = totalPrincipal;
+        
+        emit CompensationTriggered(currentCompensationId, triggerId, received, block.number);
     }
 
-    /// @notice Emergency trigger bypass for initial deployment
-    /// @param triggerId Registered trigger ID to execute
-    /// @dev Only owner. Use before oracle/multisig are operational.
-    ///      Should be disabled or timelocked in production.
+    /// @notice Emergency trigger for owner (testing/initial deployment)
+    /// @dev Should be disabled or timelocked in production deployment.
     function emergencyTrigger(bytes32 triggerId) external onlyOwner nonReentrant recordActivity {
         if (!validTriggers[triggerId]) revert InvalidTrigger();
-        if (claimActive) revert ClaimInProgress();
-        if (block.timestamp < lastClaimTimestamp + cooldownPeriod) revert CooldownNotElapsed();
+        if (compensationActive) revert CompensationInProgress();
+        if (block.timestamp < lastCompensationTimestamp + cooldownPeriod) revert CooldownNotElapsed();
         
-        _executeTrigger(triggerId);
+        _executeCompensation(triggerId);
     }
 
     /*//////////////////////////////////////////////////////////////
-                        CORE: USER CLAIMS
+                       COMPENSATION CLAIMS
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Claims pro-rata share of insurance payout
-    /// @dev User must have deposited before trigger block.
-    ///      Can only claim once per claim event.
-    ///      Share calculated as: claimPool * userBalance / totalSnapshot
-    function claimPayout() external nonReentrant recordActivity {
-        if (!claimActive) revert NoActiveClaim();
-        if (hasClaimed[currentClaimId][msg.sender]) revert AlreadyClaimed();
-        if (lastDepositBlock[msg.sender] >= claimTriggerBlock[currentClaimId]) {
+    /// @notice Claim compensation payout
+    function claimCompensation() external nonReentrant recordActivity {
+        if (!compensationActive) revert NoActiveCompensation();
+        if (hasCompensated[currentCompensationId][msg.sender]) revert AlreadyCompensated();
+        if (lastDepositBlock[msg.sender] >= compensationTriggerBlock[currentCompensationId]) {
             revert DepositedAfterTrigger();
         }
         
-        uint256 userBalance = userBalances[msg.sender];
-        if (userBalance == 0) revert NoBalance();
+        uint256 principal = userPrincipal[msg.sender];
+        if (principal == 0) revert NoBalance();
         
-        uint256 totalSnapshot = totalSnapshotBalances[currentClaimId];
-        uint256 claimPool = claimPoolAmounts[currentClaimId];
+        uint256 totalSnapshot = totalSnapshotBalances[currentCompensationId];
+        uint256 pool = compensationPoolAmounts[currentCompensationId];
         
-        uint256 userShare = (claimPool * userBalance) / totalSnapshot;
+        uint256 userShare = (pool * principal) / totalSnapshot;
         if (userShare == 0) revert ShareTooSmall();
         
-        hasClaimed[currentClaimId][msg.sender] = true;
-        claimedAmounts[currentClaimId] += userShare;
-        totalClaimsPaid += userShare;
+        // Check contract has enough balance
+        if (IERC20(DEPOSIT_TOKEN).balanceOf(address(this)) < userShare) {
+            revert InsufficientContractBalance();
+        }
+        
+        hasCompensated[currentCompensationId][msg.sender] = true;
+        compensatedAmounts[currentCompensationId] += userShare;
+        totalCompensationPaid += userShare;
         
         IERC20(DEPOSIT_TOKEN).safeTransfer(msg.sender, userShare);
         
-        emit ClaimPayout(currentClaimId, msg.sender, userShare);
+        emit CompensationPaid(currentCompensationId, msg.sender, userShare);
     }
 
-    /// @notice Calculates claimable amount for a user
-    /// @param user Address to check
-    /// @return amount Tokens claimable (0 if ineligible)
-    /// @dev Returns 0 if: no active claim, already claimed, deposited after trigger, or no balance
-    function getClaimableAmount(address user) external view returns (uint256 amount) {
-        if (!claimActive) return 0;
-        if (hasClaimed[currentClaimId][user]) return 0;
-        if (lastDepositBlock[user] >= claimTriggerBlock[currentClaimId]) return 0;
+    /// @notice Get user's claimable compensation
+    function getClaimableCompensation(address user) external view returns (uint256) {
+        if (!compensationActive) return 0;
+        if (hasCompensated[currentCompensationId][user]) return 0;
+        if (lastDepositBlock[user] >= compensationTriggerBlock[currentCompensationId]) return 0;
         
-        uint256 userBalance = userBalances[user];
-        if (userBalance == 0) return 0;
+        uint256 principal = userPrincipal[user];
+        if (principal == 0) return 0;
         
-        uint256 totalSnapshot = totalSnapshotBalances[currentClaimId];
-        uint256 claimPool = claimPoolAmounts[currentClaimId];
+        uint256 totalSnapshot = totalSnapshotBalances[currentCompensationId];
+        uint256 pool = compensationPoolAmounts[currentCompensationId];
         
-        return (claimPool * userBalance) / totalSnapshot;
+        return (pool * principal) / totalSnapshot;
     }
 
-    /*//////////////////////////////////////////////////////////////
-                      ADMIN: END CLAIM PERIOD
-    //////////////////////////////////////////////////////////////*/
-
-    /// @notice Ends active claim period and returns unclaimed to seed
-    /// @dev Only owner. Must wait MIN_CLAIM_WINDOW (30 days) after trigger.
-    ///      Unclaimed tokens are re-supplied to Aave seed.
-    function endClaimPeriod() external onlyOwner recordActivity {
-        if (!claimActive) revert NoActiveClaim();
-        if (block.timestamp < lastClaimTimestamp + MIN_CLAIM_WINDOW) {
-            revert ClaimWindowNotElapsed();
+    /// @notice End compensation period, return unclaimed to seed
+    function endCompensationPeriod() external onlyOwner recordActivity {
+        if (!compensationActive) revert NoActiveCompensation();
+        if (block.timestamp < lastCompensationTimestamp + MIN_COMPENSATION_WINDOW) {
+            revert CompensationWindowNotElapsed();
         }
         
-        uint256 claimPool = claimPoolAmounts[currentClaimId];
-        uint256 claimed = claimedAmounts[currentClaimId];
-        uint256 unclaimed = claimPool - claimed;
+        uint256 pool = compensationPoolAmounts[currentCompensationId];
+        uint256 paid = compensatedAmounts[currentCompensationId];
+        uint256 unclaimed = pool - paid;
         
+        // Return unclaimed to seed (re-supply to Aave)
         if (unclaimed > 0) {
             IERC20(DEPOSIT_TOKEN).forceApprove(AAVE_POOL, unclaimed);
             IPool(AAVE_POOL).supply(DEPOSIT_TOKEN, unclaimed, address(this), 0);
             IERC20(DEPOSIT_TOKEN).forceApprove(AAVE_POOL, 0);
+            seedBalance += unclaimed;
         }
         
-        claimActive = false;
+        compensationActive = false;
         
-        emit ClaimPeriodEnded(currentClaimId, claimed, unclaimed);
-    }
-
-    /*//////////////////////////////////////////////////////////////
-                       YIELD DISTRIBUTION
-    //////////////////////////////////////////////////////////////*/
-
-    /// @notice Distributes tokens from yield pool
-    /// @param to Recipient address
-    /// @param amount Tokens to distribute
-    /// @dev Only owner. Cannot distribute during active claim.
-    ///      Only distributes from yield pool (contract balance), not seed.
-    function distributeYield(address to, uint256 amount) external onlyOwner nonReentrant recordActivity {
-        if (to == address(0)) revert InvalidAddress();
-        if (claimActive) revert ClaimInProgress();
-        
-        uint256 available = IERC20(DEPOSIT_TOKEN).balanceOf(address(this));
-        if (amount > available) revert InsufficientYield();
-        
-        totalYieldDistributed += amount;
-        IERC20(DEPOSIT_TOKEN).safeTransfer(to, amount);
-        
-        emit YieldDistributed(to, amount);
+        emit CompensationPeriodEnded(currentCompensationId, paid, unclaimed);
     }
 
     /*//////////////////////////////////////////////////////////////
                          DORMANCY MECHANISM
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Checks if protocol is dormant (inactive 90+ days)
-    /// @return bool True if no activity for DORMANCY_THRESHOLD
     function isDormant() public view returns (bool) {
         return block.timestamp > lastActivityTimestamp + DORMANCY_THRESHOLD;
     }
 
-    /// @notice Activates dormancy mode, enabling user withdrawals
-    /// @dev Callable by anyone if isDormant() returns true.
-    ///      Withdraws all funds from Aave to enable full distribution.
-    ///      Irreversible - deposits blocked after activation.
     function activateDormancy() external {
         if (!isDormant()) revert NotDormant();
-        if (dormancyActivated) return; // Already activated, no-op
+        if (dormancyActivated) return;
         
         dormancyActivated = true;
         
-        uint256 seedValue = IERC20(A_TOKEN).balanceOf(address(this));
-        if (seedValue > 0) {
-            IPool(AAVE_POOL).withdraw(DEPOSIT_TOKEN, type(uint256).max, address(this));
+        // Withdraw everything from Aave
+        uint256 aBalance = IERC20(A_TOKEN).balanceOf(address(this));
+        if (aBalance > 0) {
+            IPool(AAVE_POOL).withdraw(DEPOSIT_TOKEN, aBalance, address(this));
         }
         
         uint256 totalAssets = IERC20(DEPOSIT_TOKEN).balanceOf(address(this));
         
+        // Check we got at least 95% (allow small slippage in extreme conditions)
+        uint256 minExpected = (aBalance * 95) / 100;
+        if (totalAssets < minExpected) revert InsufficientAaveLiquidity();
+        
         emit DormancyActivated(block.timestamp, totalAssets);
     }
 
-    /// @notice Withdraws pro-rata share during dormancy
-    /// @dev Only after dormancy activated. One withdrawal per user.
-    ///      Share calculated against remaining assets and balances.
-    ///      Zeroes user balance to prevent double-withdrawal.
     function dormancyWithdraw() external nonReentrant {
         if (!dormancyActivated) revert DormancyNotActivated();
         if (hasDormancyWithdrawn[msg.sender]) revert AlreadyDormancyWithdrawn();
         
-        uint256 userBalance = userBalances[msg.sender];
-        if (userBalance == 0) revert NoBalance();
+        uint256 principal = userPrincipal[msg.sender];
+        if (principal == 0) revert NoBalance();
         
         uint256 totalAssets = IERC20(DEPOSIT_TOKEN).balanceOf(address(this));
-        uint256 userShare = (totalAssets * userBalance) / totalUserBalances;
+        uint256 userShare = (totalAssets * principal) / totalPrincipal;
         
         if (userShare == 0) revert ShareTooSmall();
+        
+        // Cap at 10% of total assets per tx (prevents whale griefing)
+        uint256 maxPerTx = totalAssets / 10;
+        if (userShare > maxPerTx) revert ExceedsDormancyTxCap();
         
         hasDormancyWithdrawn[msg.sender] = true;
         totalDormancyWithdrawn += userShare;
         
-        totalUserBalances -= userBalance;
-        userBalances[msg.sender] = 0;
+        totalPrincipal -= principal;
+        userPrincipal[msg.sender] = 0;
         
         IERC20(DEPOSIT_TOKEN).safeTransfer(msg.sender, userShare);
         
         emit DormancyWithdrawal(msg.sender, userShare);
     }
 
-    /// @notice Calculates user's dormancy withdrawal amount
-    /// @param user Address to check
-    /// @return amount Tokens withdrawable (0 if ineligible)
-    function getDormancyAmount(address user) external view returns (uint256) {
-        if (!dormancyActivated) return 0;
-        if (hasDormancyWithdrawn[user]) return 0;
+    function heartbeat() external onlyOwner {
+        lastActivityTimestamp = block.timestamp;
+        emit Heartbeat(block.timestamp);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                         ADMIN: CONFIG
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Update yield split (must total 100%)
+    /// @dev In production, this function should be called via a timelock/multisig contract.
+    function updateYieldSplit(
+        uint256 _userBps,
+        uint256 _seedBps,
+        uint256 _treasuryBps
+    ) external onlyOwner {
+        if (_userBps + _seedBps + _treasuryBps != BPS_DENOMINATOR) revert SplitMustEqual100();
         
-        uint256 userBalance = userBalances[user];
-        if (userBalance == 0) return 0;
+        userYieldBps = _userBps;
+        seedYieldBps = _seedBps;
+        treasuryYieldBps = _treasuryBps;
         
-        uint256 totalAssets = IERC20(DEPOSIT_TOKEN).balanceOf(address(this));
-        return (totalAssets * userBalance) / totalUserBalances;
+        emit ConfigUpdated(_userBps, _seedBps, _treasuryBps, maxCompensationBps, cooldownPeriod);
+    }
+
+    /// @notice Update protection parameters
+    /// @dev In production, this function should be called via a timelock/multisig contract.
+    function updateProtectionConfig(
+        uint256 _maxCompensationBps,
+        uint256 _cooldownPeriod
+    ) external onlyOwner {
+        if (_maxCompensationBps == 0 || _maxCompensationBps > 5000) revert ConfigOutOfRange();
+        if (_cooldownPeriod < MIN_COOLDOWN) revert ConfigOutOfRange();
+        
+        maxCompensationBps = _maxCompensationBps;
+        cooldownPeriod = _cooldownPeriod;
+        
+        emit ConfigUpdated(userYieldBps, seedYieldBps, treasuryYieldBps, _maxCompensationBps, _cooldownPeriod);
+    }
+
+    /// @notice Update trigger governance addresses
+    /// @dev In production, this function should be called via a timelock/multisig contract.
+    function updateGovernance(address _oracle, address _multisig) external onlyOwner {
+        if (_oracle == address(0)) revert InvalidAddress();
+        if (_multisig == address(0)) revert InvalidAddress();
+        
+        triggerOracle = _oracle;
+        triggerMultisig = _multisig;
+        
+        emit GovernanceUpdated(_oracle, _multisig);
+    }
+
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    function unpause() external onlyOwner {
+        _unpause();
     }
 
     /*//////////////////////////////////////////////////////////////
                           VIEW FUNCTIONS
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Returns comprehensive seed and protocol status
-    /// @return seedPrincipal Cumulative tokens supplied to Aave
-    /// @return seedValue Current aToken balance (principal + yield)
-    /// @return seedYield Accrued yield (seedValue - seedPrincipal)
-    /// @return yieldPoolBalance Tokens in yield pool (contract balance)
-    /// @return isClaimActive Whether claim event is in progress
-    /// @return currentClaim Current claim event ID
-    /// @return cooldownRemaining Seconds until next trigger allowed
-    /// @return claimWindowRemaining Seconds until claim can be ended
-    /// @return dormancyCountdown Seconds until dormancy can activate
-    /// @return isDormancyActive Whether dormancy has been activated
-    function getSeedStatus() external view returns (
-        uint256 seedPrincipal,
-        uint256 seedValue,
-        uint256 seedYield,
-        uint256 yieldPoolBalance,
-        bool isClaimActive,
-        uint256 currentClaim,
-        uint256 cooldownRemaining,
-        uint256 claimWindowRemaining,
-        uint256 dormancyCountdown,
-        bool isDormancyActive
+    /// @notice Get protocol status
+    function getStatus() external view returns (
+        uint256 _totalPrincipal,
+        uint256 _seedBalance,
+        uint256 _treasuryBalance,
+        uint256 _aTokenBalance,
+        uint256 _pendingYield,
+        bool _compensationActive,
+        bool _dormant
     ) {
-        seedPrincipal = totalSeeded;
-        seedValue = IERC20(A_TOKEN).balanceOf(address(this));
-        seedYield = seedValue > totalSeeded ? seedValue - totalSeeded : 0;
-        yieldPoolBalance = IERC20(DEPOSIT_TOKEN).balanceOf(address(this));
-        isClaimActive = claimActive;
-        currentClaim = currentClaimId;
-        isDormancyActive = dormancyActivated;
+        _totalPrincipal = totalPrincipal;
+        _seedBalance = seedBalance;
+        _treasuryBalance = treasuryBalance;
+        _aTokenBalance = IERC20(A_TOKEN).balanceOf(address(this));
         
-        if (block.timestamp < lastClaimTimestamp + cooldownPeriod) {
-            cooldownRemaining = (lastClaimTimestamp + cooldownPeriod) - block.timestamp;
-        }
+        uint256 allocated = totalPrincipal + seedBalance + treasuryBalance;
+        _pendingYield = _aTokenBalance > allocated ? _aTokenBalance - allocated : 0;
         
-        if (claimActive && block.timestamp < lastClaimTimestamp + MIN_CLAIM_WINDOW) {
-            claimWindowRemaining = (lastClaimTimestamp + MIN_CLAIM_WINDOW) - block.timestamp;
-        }
-        
-        if (!dormancyActivated && block.timestamp < lastActivityTimestamp + DORMANCY_THRESHOLD) {
-            dormancyCountdown = (lastActivityTimestamp + DORMANCY_THRESHOLD) - block.timestamp;
-        }
+        _compensationActive = compensationActive;
+        _dormant = dormancyActivated;
     }
 
-    /// @notice Returns trigger governance status
-    /// @return oracle Current trigger oracle address
-    /// @return multisig Current trigger multi-sig address
-    /// @return pendingTrigger Pending trigger ID (bytes32(0) if none)
-    /// @return proposedAt Timestamp of pending trigger proposal
-    /// @return confirmableAfter Earliest confirmation timestamp
-    /// @return expiresAt Latest confirmation timestamp
-    function getTriggerStatus() external view returns (
-        address oracle,
-        address multisig,
-        bytes32 pendingTrigger,
-        uint256 proposedAt,
-        uint256 confirmableAfter,
-        uint256 expiresAt
+    /// @notice Get user position
+    function getUserPosition(address user) external view returns (
+        uint256 principal,
+        uint256 claimableYield,
+        uint256 claimableCompensation,
+        uint256 depositBlock
     ) {
-        oracle = triggerOracle;
-        multisig = triggerMultisig;
-        pendingTrigger = pendingTriggerId;
-        proposedAt = triggerProposedAt;
+        principal = userPrincipal[user];
+        claimableYield = getClaimableYield(user);
+        depositBlock = lastDepositBlock[user];
         
-        if (pendingTriggerId != bytes32(0)) {
-            confirmableAfter = triggerProposedAt + TRIGGER_MIN_DELAY;
-            expiresAt = triggerProposedAt + TRIGGER_CONFIRMATION_WINDOW;
+        if (compensationActive && 
+            !hasCompensated[currentCompensationId][user] &&
+            lastDepositBlock[user] < compensationTriggerBlock[currentCompensationId] &&
+            principal > 0) {
+            uint256 totalSnapshot = totalSnapshotBalances[currentCompensationId];
+            uint256 pool = compensationPoolAmounts[currentCompensationId];
+            claimableCompensation = (pool * principal) / totalSnapshot;
         }
     }
 
-    /// @notice Returns current seed value including yield
-    /// @return uint256 Current aToken balance
-    function getSeedValue() external view returns (uint256) {
-        return IERC20(A_TOKEN).balanceOf(address(this));
-    }
-
-    /// @notice Returns accrued seed yield
-    /// @return uint256 Yield amount (0 if no yield accrued)
-    function getSeedYield() external view returns (uint256) {
-        uint256 current = IERC20(A_TOKEN).balanceOf(address(this));
-        return current > totalSeeded ? current - totalSeeded : 0;
-    }
-
-    /// @notice Checks if trigger ID is registered
-    /// @param triggerId Trigger to check
-    /// @return bool True if trigger is valid
-    function isTriggerValid(bytes32 triggerId) external view returns (bool) {
-        return validTriggers[triggerId];
-    }
-
-    /// @notice Returns user's cumulative deposit balance
-    /// @param user Address to check
-    /// @return uint256 User's balance
-    function getUserBalance(address user) external view returns (uint256) {
-        return userBalances[user];
-    }
-
-    /// @notice Returns block of user's most recent deposit
-    /// @param user Address to check
-    /// @return uint256 Block number
-    function getUserLastDepositBlock(address user) external view returns (uint256) {
-        return lastDepositBlock[user];
-    }
-
-    /// @notice Returns statistics for a specific claim event
-    /// @param claimId Claim event ID to query
-    /// @return triggerBlock Block when claim was triggered
-    /// @return totalSnapshot Total balances at trigger time
-    /// @return poolAmount Tokens available for claims
-    /// @return claimedAmount Tokens claimed so far
-    function getClaimStats(uint256 claimId) external view returns (
-        uint256 triggerBlock,
-        uint256 totalSnapshot,
-        uint256 poolAmount,
-        uint256 claimedAmount
+    /// @notice Get yield split configuration
+    function getYieldSplit() external view returns (
+        uint256 userBps,
+        uint256 seedBps,
+        uint256 treasuryBps
     ) {
-        return (
-            claimTriggerBlock[claimId],
-            totalSnapshotBalances[claimId],
-            claimPoolAmounts[claimId],
-            claimedAmounts[claimId]
-        );
+        return (userYieldBps, seedYieldBps, treasuryYieldBps);
     }
 
-    /*//////////////////////////////////////////////////////////////
-                       EMERGENCY RECOVERY
-    //////////////////////////////////////////////////////////////*/
-
-    /// @notice Recovers accidentally sent tokens
-    /// @param token Token address to recover
-    /// @param amount Amount to recover
-    /// @param to Recipient address
-    /// @dev Only owner. Cannot recover A_TOKEN (seed is protected).
-    function recoverToken(address token, uint256 amount, address to) external onlyOwner {
-        if (token == A_TOKEN) revert CannotTouchSeed();
-        if (to == address(0)) revert InvalidAddress();
-        
-        IERC20(token).safeTransfer(to, amount);
+    /// @notice Get dormancy countdown in seconds
+    function getDormancyCountdown() external view returns (uint256) {
+        if (dormancyActivated) return 0;
+        uint256 dormancyTime = lastActivityTimestamp + DORMANCY_THRESHOLD;
+        if (block.timestamp >= dormancyTime) return 0;
+        return dormancyTime - block.timestamp;
     }
 }
