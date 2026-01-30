@@ -1,64 +1,86 @@
-# 🌱 Protocol Protection Layer
+# 🌱 Protocol Protection Layer V2
 
-**Eternal Seed Variant 8 : Self-Funding Protocol Protection**
+**Eternal Seed Variant 8: Yield-Funded Embedded Protection**
 
-**Current Version: 3.1**
+*Current Version: 2.0*
 
-> (Un)popular opinion: protocols shouldn't buy insurance.. they should *be* insurance.
-> No premiums leaving the system.. no external underwriters.. no committees deciding if you deserve a payout.
-> Just open code that pays when it says. Eternally fair.
+---
+
+## The Idea
+
+You came for yield. Protection is included.
+
+Like train tickets with delay compensation. Like credit cards with purchase protection. You didn't pay extra. It's just there.
 
 ---
 
 ## What Is This?
 
-A primitive that turns any protocol into its own protection layer.
+A primitive that embeds protection into yield-generating protocols.
 
-**The Problem:**
-- Most protocols have no answer for "what if we get hacked?"
-- External coverage (Nexus Mutual) requires premiums that leave your ecosystem
-- Token emissions to cover losses = slow rug via dilution
-- Discretionary claim committees decide if you receive a payout
+**The Old Way:**
+- Deposit funds, earn yield
+- Protocol gets hacked, you lose everything
+- Maybe a governance vote about compensation months later
+- Maybe nothing
 
-**The Solution:**
-- A seed that grows from normal transaction flow
-- Compounds via Aave yield (rising floor)
-- Opens on verified triggers (oracle proposes, multi-sig confirms)
-- No premiums. No emissions. No claim committees.
-
-**Protection as infrastructure, not expense.**
+**The PPL Way:**
+- Deposit funds, earn yield
+- Protection builds automatically from a slice of yield
+- If something goes wrong, compensation is automatic
+- No votes, no committees, no uncertainty
 
 ---
 
 ## How It Works
 
 ```
+User deposits (e.g., 1000 USDC)
+        │
+        └──► ALL funds go to Aave (earning yield)
+        
+Yield generated over time
+        │
+        ├──► 80% → User (competitive return)
+        ├──► 10% → Protection Seed (grows, compounds)
+        └──► 10% → Treasury (operations)
+
+User can withdraw principal ANYTIME.
+Protection is funded by yield, not by locking deposits.
+```
+
+**Key difference from V1:** Principal stays liquid. Seed grows from yield only.
+
+---
+
+## The Flow
+
+```
 ┌─────────────────────────────────────────────────────────────────┐
 │                         NORMAL OPERATION                        │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
-│   User Deposit                                                  │
+│   User Deposit (100%)                                           │
 │        │                                                        │
 │        ▼                                                        │
 │   ┌─────────┐                                                   │
-│   │  Split  │                                                   │
+│   │  Aave   │  ← All funds earn yield                          │
 │   └────┬────┘                                                   │
 │        │                                                        │
-│   ┌────┴────┐                                                   │
-│   │         │                                                   │
-│   ▼         ▼                                                   │
-│ ┌─────┐  ┌──────────┐                                          │
-│ │Seed │  │Yield Pool│                                          │
-│ │(15%)│  │  (85%)   │                                          │
-│ └──┬──┘  └────┬─────┘                                          │
-│    │          │                                                 │
-│    ▼          ▼                                                 │
-│ ┌─────┐  ┌──────────┐                                          │
-│ │Aave │  │Operations│                                          │
-│ │Yield│  │ Rewards  │                                          │
-│ └─────┘  └──────────┘                                          │
-│                                                                 │
-│   Seed compounds. Floor rises. Protection grows.                │
+│        ▼                                                        │
+│   Yield Generated                                               │
+│        │                                                        │
+│   ┌────┴────────────┬────────────┐                             │
+│   │                 │            │                              │
+│   ▼                 ▼            ▼                              │
+│ ┌──────┐      ┌──────┐     ┌─────────┐                         │
+│ │ User │      │ Seed │     │Treasury │                         │
+│ │ 80%  │      │ 10%  │     │  10%    │                         │
+│ └──────┘      └──────┘     └─────────┘                         │
+│                  │                                              │
+│                  ▼                                              │
+│            Compounds in Aave                                    │
+│            Protection grows                                     │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 
@@ -69,10 +91,10 @@ A primitive that turns any protocol into its own protection layer.
 │   1. Oracle detects exploit/failure                             │
 │   2. Proposes trigger to contract                               │
 │   3. Multi-sig confirms (1-24hr window)                         │
-│   4. Seed releases up to 50%*                                    │
+│   4. Seed releases up to 50%                                    │
 │   5. Users claim pro-rata shares                                │
 │   6. Unclaimed returns to seed after 30 days                    │
-│   7. Seed rebuilds from ongoing deposits                        │
+│   7. Seed rebuilds from ongoing yield                           │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -81,6 +103,9 @@ A primitive that turns any protocol into its own protection layer.
 
 ## Key Features
 
+### 💧 Liquid Principal
+Withdraw your deposit anytime. No lock-ups. Protection is funded by yield, not by trapping your money.
+
 ### 🛡️ Front-Run Protection
 Attackers can't deposit after seeing an exploit and claim payouts. Block-anchored snapshots ensure only pre-exploit depositors are eligible.
 
@@ -88,19 +113,13 @@ Attackers can't deposit after seeing an exploit and claim payouts. Block-anchore
 Two-phase commit: Oracle proposes, multi-sig confirms. Minimum 1-hour delay prevents compromised oracles from draining the seed.
 
 ### 💤 Dormancy Protection
-If protocol goes inactive for 90 days, anyone can activate dormancy mode. Users can withdraw their pro-rata share.
+If protocol goes inactive for 90 days, anyone can activate dormancy mode. Users can withdraw their pro-rata share. Funds are never trapped.
 
 ### 🔄 Cascade Prevention
-7-day minimum cooldown between claim events prevents attackers from bleeding the seed with rapid small triggers.
-
-### 💓 Heartbeat Function
-Owner can call `heartbeat()` to reset dormancy timer if protocol is healthy but has low deposit activity. Prevents unintended dormancy.
-
-### 🔢 Dynamic Token Support
-MIN_DEPOSIT is automatically derived from token decimals. Works with USDC (6), DAI (18), WBTC (8), or any ERC20.
+7-day minimum cooldown between compensation events prevents attackers from bleeding the seed with rapid triggers.
 
 ### 📊 Full Transparency
-All balances, claims, and payouts are on-chain and verifiable. No discretionary decisions.
+All balances, yields, and payouts are on-chain and verifiable. No discretionary decisions.
 
 ---
 
@@ -108,14 +127,16 @@ All balances, claims, and payouts are on-chain and verifiable. No discretionary 
 
 | Parameter | Description | Default | Range |
 |-----------|-------------|---------|-------|
-| `seedBps` | % of deposits to seed | 1500 (15%) | 1-5000 |
-| `maxClaimBps` | Max % claimable per event | 5000 (50%) | 1-5000 |
-| `cooldownPeriod` | Time between claims | 7 days | ≥7 days |
-| `MIN_DEPOSIT` | Minimum deposit amount | 1 token | Auto (from decimals) |
-| `DORMANCY_THRESHOLD` | Inactivity before dormancy | 90 days | Fixed |
-| `MIN_CLAIM_WINDOW` | Minimum claim period | 30 days | Fixed |
-| `TRIGGER_MIN_DELAY` | Delay before confirm | 1 hour | Fixed |
-| `TRIGGER_CONFIRMATION_WINDOW` | Max confirm window | 24 hours | Fixed |
+| userYieldBps | User's share of yield | 8000 (80%) | 1-9999 |
+| seedYieldBps | Seed's share of yield | 1000 (10%) | 1-9999 |
+| treasuryYieldBps | Treasury's share | 1000 (10%) | 1-9999 |
+| maxCompensationBps | Max % of seed per event | 5000 (50%) | 1-5000 |
+| cooldownPeriod | Time between events | 7 days | ≥7 days |
+| MIN_DEPOSIT | Minimum deposit | 1 token | Auto (from decimals) |
+| DORMANCY_THRESHOLD | Inactivity trigger | 90 days | Fixed |
+| MIN_COMPENSATION_WINDOW | Claim period | 30 days | Fixed |
+
+*Yield split must total 100% (10000 bps).*
 
 ---
 
@@ -132,52 +153,78 @@ forge install
 ```solidity
 constructor(
     address _depositToken,      // e.g., USDC
-    address _aToken,            // e.g., aUSDC
+    address _aToken,            // e.g., aUSDC  
     address _aavePool,          // Aave V3 Pool
-    uint256 _seedBps,           // e.g., 1500 (15%)
-    uint256 _maxClaimBps,       // e.g., 5000 (50%)
-    uint256 _cooldownPeriod,    // e.g., 7 days
     address _triggerOracle,     // Chainlink Automation
     address _triggerMultisig    // Gnosis Safe
 )
 ```
 
+Default config: 80/10/10 split, 50% max compensation, 7-day cooldown.
+
 ---
 
-## Integration
+## User Functions
 
-### For Protocols
+| Function | What It Does |
+|----------|--------------|
+| `deposit(amount)` | Deposit tokens, all go to Aave |
+| `withdraw(amount)` | Withdraw principal anytime |
+| `claimYield()` | Claim accumulated yield (80% share) |
+| `claimCompensation()` | Claim payout after trigger event |
+| `dormancyWithdraw()` | Exit if protocol inactive 90 days |
+
+---
+
+## Admin Functions
+
+| Function | What It Does | Notes |
+|----------|--------------|-------|
+| `addTrigger(id, desc)` | Register trigger type | e.g., "AAVE_EXPLOIT" |
+| `removeTrigger(id)` | Deregister trigger | |
+| `updateYieldSplit(...)` | Change 80/10/10 | Must sum to 100% |
+| `withdrawTreasury(...)` | Withdraw treasury funds | Timelock recommended |
+| `heartbeat()` | Reset dormancy timer | Call every ~60 days |
+| `pause() / unpause()` | Emergency controls | |
+
+*All admin functions should be behind a timelock in production.*
+
+---
+
+## Trigger Flow
 
 ```solidity
-// In your deposit/payment function:
-function userDeposit(uint256 amount) external {
-    token.transferFrom(msg.sender, address(this), amount);
-    
-    // Route through protection layer
-    token.approve(address(protectionLayer), amount);
-    protectionLayer.deposit(amount);
-}
+// 1. Oracle proposes (deposits halt immediately)
+ppl.proposeTrigger(keccak256("AAVE_EXPLOIT"));
+
+// 2. Wait 1-24 hours
+
+// 3. Multi-sig confirms
+ppl.confirmTrigger();
+
+// 4. Users claim their share
+ppl.claimCompensation();
+
+// 5. After 30 days, owner ends period
+ppl.endCompensationPeriod();
 ```
 
-### Setting Up Triggers
+---
 
-```solidity
-// Register trigger types
-ppl.addTrigger(
-    keccak256("AAVE_EXPLOIT"),
-    "Aave protocol exploit detected"
-);
+## Risk Factors
 
-ppl.addTrigger(
-    keccak256("ORACLE_MANIPULATION"),
-    "Price oracle manipulation detected"
-);
+These are known limitations and trade-offs.
 
-ppl.addTrigger(
-    keccak256("GOVERNANCE_EMERGENCY"),
-    "Emergency declared by governance"
-);
-```
+| Risk | Description |
+|------|-------------|
+| **Yield Timing** | Pro-rata model allows "yield sniping" by large depositors entering after harvest |
+| **Aave Dependency** | If Aave restricts withdrawals, PPL is affected |
+| **Compensation Freeze** | Deposits/withdrawals pause during 30-day compensation window |
+| **Dormancy Queue** | 10% per-tx cap creates first-come-first-served during exit |
+| **Trigger Centralisation** | Oracle + multisig compromise could drain seed |
+| **Underfunding** | Seed (10% of yield) may be smaller than losses in major events |
+
+This is embedded protection, not insurance. The seed improves outcomes. It does not guarantee them.
 
 ---
 
@@ -187,23 +234,18 @@ ppl.addTrigger(
 
 | Component | Trust Level | Notes |
 |-----------|-------------|-------|
-| Owner | High | Can add/remove triggers, update config. Should be timelocked. |
+| Owner | High | Config changes. Should be timelocked. |
 | Oracle | Medium | Can only propose, not execute. 1hr delay allows cancellation. |
 | Multi-sig | Medium | Can only confirm valid proposals within window. |
-| Aave | External | Yield source. Failure redirects to yield pool. |
+| Aave | External | Yield source. If Aave fails, PPL is affected. |
 
-### Invariants
+### Pre-Audit Hardening (V2.0)
 
-1. **Rising Floor**: Under normal operation, seed principal only exits via approved claims or dormancy
-2. **No Front-Running**: Deposits after trigger block are ineligible
-3. **No Cascade Drain**: Minimum 7-day cooldown between claims
-4. **Dormancy Exit**: 90-day inactivity enables fund recovery
-
-### Known Limitations
-
-- `emergencyTrigger()` allows owner bypass. Disable or timelock in production
-- Yield source (Aave) failure doesn't trigger protection, redirects to yield pool
-- Pro-rata claims favor larger depositors proportionally
+- ✅ Post-withdraw balance checks (reverts if Aave returns <95%)
+- ✅ Contract balance checks before all transfers
+- ✅ Anti-spam on `harvestYield()` (reverts if no yield)
+- ✅ 10% per-tx cap on dormancy withdrawals
+- ✅ Timelock comments on all admin functions
 
 ---
 
@@ -212,8 +254,9 @@ ppl.addTrigger(
 | Item | Status |
 |------|--------|
 | Specification | ✅ Complete |
-| Implementation | ✅ Complete |
-| Natspec | ✅ Complete |
+| Implementation | ✅ Complete (V2.0) |
+| NatSpec | ✅ Complete |
+| Pre-Audit Polish | ✅ Complete |
 | Unit Tests | 🔄 In Progress |
 | Audit | ⏳ Pending |
 
@@ -224,7 +267,7 @@ ppl.addTrigger(
 **Business Source License 1.1 (BUSL-1.1)**
 
 - **Licensor:** DYBL Foundation
-- **Licensed Work:** Protocol Protection Layer & Eternal Seed Mechanism
+- **Licensed Work:** Protocol Protection Layer
 - **Change Date:** May 10, 2029
 - **Change License:** MIT
 
@@ -236,17 +279,20 @@ For commercial licensing before 2029, contact: dybl7@proton.me
 
 ## Contact
 
-- 📧 Email: dybl7@proton.me
-- 🐦 Twitter: [@DYBL77](https://twitter.com/DYBL77)
-- 💬 Discord: dybl777
-- 🔗 GitHub: [github.com/DYBL777](https://github.com/DYBL777)
+📧 Email: dybl7@proton.me  
+🐦 Twitter: [@DYBL77](https://x.com/DYBL77)  
+💻 GitHub: [github.com/DYBL777](https://github.com/DYBL777)
 
 ---
 
-## Part of the Eternal Seed Family
+## Part of The Eternal Seed Family
 
-This is the production implementation of **Variant 8: Protection Layer Seed** from the [SeedEngine specification](https://github.com/DYBL777/SeedEngine-Permanent-Capital-Retention-Primitive).
+This is the production implementation of **Variant 8: Protection Layer** from The Eternal Seed specification (TES.sol_V1.1).
+
+Other variants include lotteries, savings products, and more. See the full specification for details.
 
 ---
 
-🌱 *A seed that grows from within. A floor that rises. Eternally fair.*
+*You came for yield. Protection is included.*
+
+🌱
