@@ -142,9 +142,13 @@ Think of it as a feature, not a product. A property of the system, not a separat
 
 This is a concept. These are known limitations and trade-offs.
 
-### Yield Timing
+### Yield Timing (Yield Sniping)
 
-The current yield distribution uses a simple pro-rata model. A depositor entering immediately after yield is harvested could claim a share of yield generated before they arrived. More sophisticated snapshot-based accounting could address this but adds complexity.
+The current yield distribution uses a simple pro-rata model based on current principal. A large depositor entering immediately before harvest could claim a share of yield generated before they arrived. This is a known vulnerability. Production deployment should implement a yield-per-share accumulator pattern (similar to MasterChef/Synthetix) to ensure users only earn yield generated after their deposit. Documented for V3.
+
+### Precision Loss
+
+Because yield allocation uses totalPrincipal as denominator, if principal changes between harvest and claims, the allocated amounts may not balance perfectly. In extreme cases, last claimers could face shortfall. The yield-per-share pattern recommended above also resolves this issue.
 
 ### Aave Dependency
 
