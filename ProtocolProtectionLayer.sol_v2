@@ -358,10 +358,19 @@ contract ProtocolProtectionLayerV2 is Ownable2Step, ReentrancyGuard, Pausable {
         // Transfer from user
         IERC20(DEPOSIT_TOKEN).safeTransferFrom(msg.sender, address(this), amount);
 
+        // Track aToken balance before supply
+        uint256 aTokenBefore = IERC20(A_TOKEN).balanceOf(address(this));
+
         // Supply ALL to Aave
         IERC20(DEPOSIT_TOKEN).forceApprove(AAVE_POOL, amount);
         IPool(AAVE_POOL).supply(DEPOSIT_TOKEN, amount, address(this), 0);
         IERC20(DEPOSIT_TOKEN).forceApprove(AAVE_POOL, 0);
+
+        // Verify we received expected aTokens (allow 0.1% slippage for rounding)
+        uint256 aTokenAfter = IERC20(A_TOKEN).balanceOf(address(this));
+        uint256 aTokenReceived = aTokenAfter - aTokenBefore;
+        uint256 minExpected = (amount * 999) / 1000;
+        if (aTokenReceived < minExpected) revert InsufficientAaveLiquidity();
 
         // Track user principal
         userPrincipal[msg.sender] += amount;
@@ -575,6 +584,11 @@ contract ProtocolProtectionLayerV2 is Ownable2Step, ReentrancyGuard, Pausable {
     }
 
     function _executeCompensation(bytes32 triggerId) internal {
+        // Defense in depth: verify cooldown even if caller should have checked
+        if (block.timestamp < lastCompensationTimestamp + cooldownPeriod) {
+            revert CooldownNotElapsed();
+        }
+        
         // Harvest any pending yield first
         _harvestYield();
         
@@ -722,7 +736,6 @@ contract ProtocolProtectionLayerV2 is Ownable2Step, ReentrancyGuard, Pausable {
 
     function dormancyWithdraw() external nonReentrant {
         if (!dormancyActivated) revert DormancyNotActivated();
-        if (hasDormancyWithdrawn[msg.sender]) revert AlreadyDormancyWithdrawn();
         
         uint256 principal = userPrincipal[msg.sender];
         if (principal == 0) revert NoBalance();
@@ -734,17 +747,18 @@ contract ProtocolProtectionLayerV2 is Ownable2Step, ReentrancyGuard, Pausable {
         
         // Cap at 10% of total assets per tx (prevents whale griefing)
         uint256 maxPerTx = totalAssets / 10;
-        if (userShare > maxPerTx) revert ExceedsDormancyTxCap();
+        uint256 withdrawAmount = userShare > maxPerTx ? maxPerTx : userShare;
         
-        hasDormancyWithdrawn[msg.sender] = true;
-        totalDormancyWithdrawn += userShare;
+        // Calculate proportional principal reduction
+        uint256 principalReduction = (principal * withdrawAmount) / userShare;
         
-        totalPrincipal -= principal;
-        userPrincipal[msg.sender] = 0;
+        totalDormancyWithdrawn += withdrawAmount;
+        totalPrincipal -= principalReduction;
+        userPrincipal[msg.sender] -= principalReduction;
         
-        IERC20(DEPOSIT_TOKEN).safeTransfer(msg.sender, userShare);
+        IERC20(DEPOSIT_TOKEN).safeTransfer(msg.sender, withdrawAmount);
         
-        emit DormancyWithdrawal(msg.sender, userShare);
+        emit DormancyWithdrawal(msg.sender, withdrawAmount);
     }
 
     function heartbeat() external onlyOwner {
