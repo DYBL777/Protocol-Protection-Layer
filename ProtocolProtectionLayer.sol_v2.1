@@ -5,7 +5,7 @@ pragma solidity ^0.8.20;
  * ╔══════════════════════════════════════════════════════════════════════════╗
  * ║                                                                          ║
  * ║                    PROTOCOL PROTECTION LAYER (PPL)                       ║
- * ║                         VERSION 2.0                                      ║
+ * ║                         VERSION 2.1                                      ║
  * ║                                                                          ║
  * ╠══════════════════════════════════════════════════════════════════════════╣
  * ║                                                                          ║
@@ -20,9 +20,38 @@ pragma solidity ^0.8.20;
  * ║                                                                          ║
  * ╚══════════════════════════════════════════════════════════════════════════╝
  *
- * @title ProtocolProtectionLayer V2.0
+ * @title ProtocolProtectionLayerV2_1
  * @author DYBL Foundation
  * @notice Yield-funded embedded protection. Deposit, earn, withdraw anytime.
+ *
+ * @dev V2.1 Fixes (from V2.0):
+ *   - [PPL-FIX-01] GlobalYieldIndex for time-weighted yield attribution.
+ *                   Prevents yield sniping (late depositor claiming early yield).
+ *                   Ported from Lettery S1 globalYieldIndex pattern.
+ *   - [PPL-FIX-02] totalUserYieldAccrued added to allocated calculation.
+ *                   V2.0 did not track user yield in the allocated total, causing
+ *                   _harvestYield() to re-distribute previously allocated user yield
+ *                   on every subsequent call (double-distribution bug).
+ *   - [PPL-FIX-03] Constructor sets max Aave approval once. Removes per-operation
+ *                   forceApprove/revoke in deposit() and endCompensationPeriod().
+ *                   Saves gas on every deposit and compensation cleanup.
+ *   - [PPL-FIX-04] Dormancy activation and withdrawal blocked during active
+ *                   compensation. Prevents activateDormancy() from withdrawing
+ *                   all Aave funds while compensation claims are pending.
+ *   - [PPL-FIX-05] Users who withdraw all principal can still claim accumulated
+ *                   yield. V2.0 getClaimableYield() returned 0 for zero-principal
+ *                   users, trapping their earned yield.
+ *   - [PPL-FIX-09] Guard on totalUserYieldAccrued subtraction. Index rounding dust
+ *                   over thousands of claims could cause underflow revert. Caps
+ *                   claimable to totalUserYieldAccrued if dust exceeds it.
+ *   - [PPL-FIX-06] Minimum bounds on yield split: user >= 50%, seed >= 5%.
+ *                   Prevents owner from zeroing out user yield or eliminating
+ *                   protection. Max treasury implicitly capped at 45%.
+ *   - [PPL-FIX-07] nonReentrant added to activateDormancy() and
+ *                   endCompensationPeriod(). Both make external calls to Aave.
+ *   - [PPL-FIX-08] Liquidity check on withdrawTreasury(). Withdraws to contract
+ *                   first, verifies received amount, then transfers. Matches the
+ *                   pattern used in claimYield() and withdraw().
  *
  * @dev The Concept:
  *      You came for yield. Protection is included.
@@ -68,7 +97,7 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@aave/core-v3/contracts/interfaces/IPool.sol";
 
-contract ProtocolProtectionLayerV2 is Ownable2Step, ReentrancyGuard, Pausable {
+contract ProtocolProtectionLayerV2_1 is Ownable2Step, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
 
     /*//////////////////////////////////////////////////////////////
@@ -94,6 +123,36 @@ contract ProtocolProtectionLayerV2 is Ownable2Step, ReentrancyGuard, Pausable {
     uint256 public treasuryYieldBps;
 
     uint256 public constant BPS_DENOMINATOR = 10000;
+
+    /// @notice [PPL-FIX-06] Minimum user yield: 50%. Users always get majority of yield.
+    uint256 public constant MIN_USER_YIELD_BPS = 5000;
+
+    /// @notice [PPL-FIX-06] Minimum seed yield: 5%. Protection fund always grows.
+    uint256 public constant MIN_SEED_YIELD_BPS = 500;
+
+    /*//////////////////////////////////////////////////////////////
+                     YIELD INDEX (PPL-FIX-01)
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Precision multiplier for yield index calculations
+    uint256 public constant YIELD_PRECISION = 1e18;
+
+    /// @notice Global yield index. Increases each harvest by (userYield * PRECISION / totalPrincipal).
+    ///         Users earn yield proportional to their principal AND duration of deposit.
+    uint256 public globalYieldIndex;
+
+    /// @notice Per-user yield index snapshot. Set to globalYieldIndex on every interaction.
+    mapping(address => uint256) public userYieldIndex;
+
+    /// @notice Per-user accumulated yield (settled from index delta, not yet claimed).
+    mapping(address => uint256) public accumulatedYield;
+
+    /// @notice Per-user yield already claimed (withdrawn as USDC).
+    mapping(address => uint256) public yieldClaimed;
+
+    /// @notice Total user yield sitting in Aave, not yet claimed. [PPL-FIX-02]
+    ///         Included in allocated calculation to prevent double-distribution.
+    uint256 public totalUserYieldAccrued;
 
     /*//////////////////////////////////////////////////////////////
                          PROTECTION CONFIG
@@ -155,9 +214,6 @@ contract ProtocolProtectionLayerV2 is Ownable2Step, ReentrancyGuard, Pausable {
     /// @notice User's deposited principal
     mapping(address => uint256) public userPrincipal;
 
-    /// @notice User's yield already claimed
-    mapping(address => uint256) public userYieldClaimed;
-
     /// @notice Block of user's last deposit (for front-run protection)
     mapping(address => uint256) public lastDepositBlock;
 
@@ -174,13 +230,10 @@ contract ProtocolProtectionLayerV2 is Ownable2Step, ReentrancyGuard, Pausable {
     /// @notice Treasury balance available for withdrawal
     uint256 public treasuryBalance;
 
-    /// @notice Total user yield distributed (for pro-rata calculation)
-    uint256 public totalUserYieldDistributed;
-
-    /// @notice Total yield sent to seed
+    /// @notice Total yield sent to seed (cumulative, for analytics)
     uint256 public totalSeedYieldReceived;
 
-    /// @notice Total yield sent to treasury
+    /// @notice Total yield sent to treasury (cumulative, for analytics)
     uint256 public totalTreasuryYieldReceived;
 
     /// @notice Total compensation paid out
@@ -200,6 +253,7 @@ contract ProtocolProtectionLayerV2 is Ownable2Step, ReentrancyGuard, Pausable {
     event Deposited(address indexed user, uint256 amount);
     event Withdrawn(address indexed user, uint256 amount);
     event YieldHarvested(uint256 totalYield, uint256 toUsers, uint256 toSeed, uint256 toTreasury);
+    event YieldSettled(address indexed user, uint256 earned, uint256 accumulated);  // [PPL-FIX-01]
     event YieldClaimed(address indexed user, uint256 amount);
     event TreasuryWithdrawn(address indexed to, uint256 amount);
 
@@ -286,7 +340,7 @@ contract ProtocolProtectionLayerV2 is Ownable2Step, ReentrancyGuard, Pausable {
                             CONSTRUCTOR
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Deploy PPL V2
+    /// @notice Deploy PPL V2.1
     /// @param _depositToken Token for deposits (e.g., USDC)
     /// @param _aToken Corresponding Aave aToken
     /// @param _aavePool Aave V3 Pool address
@@ -325,6 +379,11 @@ contract ProtocolProtectionLayerV2 is Ownable2Step, ReentrancyGuard, Pausable {
         MIN_DEPOSIT = 10 ** decimals;
 
         lastActivityTimestamp = block.timestamp;
+
+        // [PPL-FIX-03] One-time max approval for Aave Pool.
+        // Aave supply() pulls exactly the amount specified, max approval is safe.
+        // Eliminates per-deposit forceApprove gas overhead.
+        IERC20(_depositToken).forceApprove(_aavePool, type(uint256).max);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -355,6 +414,10 @@ contract ProtocolProtectionLayerV2 is Ownable2Step, ReentrancyGuard, Pausable {
         // Harvest any pending yield first
         _harvestYield();
 
+        // [PPL-FIX-01] Settle user's yield BEFORE principal changes.
+        // Ensures yield earned at old principal is credited at old rate.
+        _settleYield(msg.sender);
+
         // Transfer from user
         IERC20(DEPOSIT_TOKEN).safeTransferFrom(msg.sender, address(this), amount);
 
@@ -362,9 +425,8 @@ contract ProtocolProtectionLayerV2 is Ownable2Step, ReentrancyGuard, Pausable {
         uint256 aTokenBefore = IERC20(A_TOKEN).balanceOf(address(this));
 
         // Supply ALL to Aave
-        IERC20(DEPOSIT_TOKEN).forceApprove(AAVE_POOL, amount);
+        // [PPL-FIX-03] No per-deposit approval needed. Constructor sets max.
         IPool(AAVE_POOL).supply(DEPOSIT_TOKEN, amount, address(this), 0);
-        IERC20(DEPOSIT_TOKEN).forceApprove(AAVE_POOL, 0);
 
         // Verify we received expected aTokens (allow 0.1% slippage for rounding)
         uint256 aTokenAfter = IERC20(A_TOKEN).balanceOf(address(this));
@@ -398,6 +460,9 @@ contract ProtocolProtectionLayerV2 is Ownable2Step, ReentrancyGuard, Pausable {
         // Harvest yield first
         _harvestYield();
 
+        // [PPL-FIX-01] Settle user's yield BEFORE principal changes.
+        _settleYield(msg.sender);
+
         // Update state
         userPrincipal[msg.sender] -= amount;
         totalPrincipal -= amount;
@@ -424,20 +489,23 @@ contract ProtocolProtectionLayerV2 is Ownable2Step, ReentrancyGuard, Pausable {
     /// @dev Reverts if no yield to harvest (prevents spam)
     function harvestYield() external nonReentrant recordActivity {
         uint256 aTokenBalance = IERC20(A_TOKEN).balanceOf(address(this));
-        uint256 allocated = totalPrincipal + seedBalance + treasuryBalance;
+        // [PPL-FIX-02] Include totalUserYieldAccrued in allocated check
+        uint256 allocated = totalPrincipal + seedBalance + treasuryBalance + totalUserYieldAccrued;
         if (aTokenBalance <= allocated) revert NoYieldToHarvest();
         
         _harvestYield();
     }
 
     /// @notice Internal yield harvesting
+    /// @dev [PPL-FIX-01] Uses globalYieldIndex for time-weighted attribution
+    /// @dev [PPL-FIX-02] Tracks totalUserYieldAccrued in allocated to prevent double-distribution
     function _harvestYield() internal {
         uint256 aTokenBalance = IERC20(A_TOKEN).balanceOf(address(this));
         
-        // What we should have: principal + seed + treasury
-        uint256 allocated = totalPrincipal + seedBalance + treasuryBalance;
+        // [PPL-FIX-02] What we should have: principal + seed + treasury + unclaimed user yield
+        uint256 allocated = totalPrincipal + seedBalance + treasuryBalance + totalUserYieldAccrued;
         
-        // If aToken balance > allocated, we have yield
+        // If aToken balance > allocated, we have new yield
         if (aTokenBalance <= allocated) return;
         
         uint256 totalYield = aTokenBalance - allocated;
@@ -446,10 +514,15 @@ contract ProtocolProtectionLayerV2 is Ownable2Step, ReentrancyGuard, Pausable {
         // Split yield according to config
         uint256 toUsers = (totalYield * userYieldBps) / BPS_DENOMINATOR;
         uint256 toSeed = (totalYield * seedYieldBps) / BPS_DENOMINATOR;
-        uint256 toTreasury = totalYield - toUsers - toSeed; // Remainder
+        uint256 toTreasury = totalYield - toUsers - toSeed; // Remainder to avoid rounding dust
 
-        // Track user yield (distributed pro-rata when claimed)
-        totalUserYieldDistributed += toUsers;
+        // [PPL-FIX-01] Distribute user yield via index (time-weighted)
+        if (totalPrincipal > 0 && toUsers > 0) {
+            globalYieldIndex += (toUsers * YIELD_PRECISION) / totalPrincipal;
+        }
+
+        // [PPL-FIX-02] Track user yield as allocated (stays in Aave until claimed)
+        totalUserYieldAccrued += toUsers;
 
         // Add to seed
         seedBalance += toSeed;
@@ -462,15 +535,42 @@ contract ProtocolProtectionLayerV2 is Ownable2Step, ReentrancyGuard, Pausable {
         emit YieldHarvested(totalYield, toUsers, toSeed, toTreasury);
     }
 
+    /// @notice Settle a user's yield up to current global index [PPL-FIX-01]
+    /// @dev Must be called BEFORE any principal change (deposit, withdrawal)
+    function _settleYield(address user) internal {
+        if (userPrincipal[user] == 0) {
+            userYieldIndex[user] = globalYieldIndex;
+            return;
+        }
+
+        uint256 indexDelta = globalYieldIndex - userYieldIndex[user];
+        if (indexDelta > 0) {
+            uint256 earned = (userPrincipal[user] * indexDelta) / YIELD_PRECISION;
+            accumulatedYield[user] += earned;
+
+            emit YieldSettled(user, earned, accumulatedYield[user]);
+        }
+
+        userYieldIndex[user] = globalYieldIndex;
+    }
+
     /// @notice Claim accumulated yield
+    /// @dev [PPL-FIX-05] Works even if user has withdrawn all principal
     function claimYield() external nonReentrant recordActivity {
         _harvestYield();
+        _settleYield(msg.sender);  // [PPL-FIX-01]
         
         uint256 claimable = getClaimableYield(msg.sender);
         if (claimable == 0) revert InsufficientYield();
 
-        // Track claimed amount
-        userYieldClaimed[msg.sender] += claimable;
+        // [PPL-FIX-09] Guard against rounding dust underflow over many claims
+        if (claimable > totalUserYieldAccrued) {
+            claimable = totalUserYieldAccrued;
+        }
+
+        // Track claimed amount (after cap, so user isn't charged for dust they didn't receive)
+        yieldClaimed[msg.sender] += claimable;
+        totalUserYieldAccrued -= claimable;
 
         // Withdraw from Aave
         uint256 balanceBefore = IERC20(DEPOSIT_TOKEN).balanceOf(address(this));
@@ -487,17 +587,20 @@ contract ProtocolProtectionLayerV2 is Ownable2Step, ReentrancyGuard, Pausable {
     }
 
     /// @notice Get user's claimable yield
+    /// @dev [PPL-FIX-01] Index-based calculation (time-weighted)
+    /// @dev [PPL-FIX-05] Returns accumulated yield even if principal is zero
     function getClaimableYield(address user) public view returns (uint256) {
-        if (totalPrincipal == 0) return 0;
-        if (userPrincipal[user] == 0) return 0;
+        uint256 accumulated = accumulatedYield[user];
         
-        // User's share of total distributed yield
-        uint256 userShare = (totalUserYieldDistributed * userPrincipal[user]) / totalPrincipal;
+        // Add pending unsettled yield (only if user has active principal)
+        if (userPrincipal[user] > 0 && globalYieldIndex > userYieldIndex[user]) {
+            uint256 indexDelta = globalYieldIndex - userYieldIndex[user];
+            uint256 pending = (userPrincipal[user] * indexDelta) / YIELD_PRECISION;
+            accumulated += pending;
+        }
         
-        // Subtract what they've already claimed
-        uint256 claimed = userYieldClaimed[user];
-        
-        return userShare > claimed ? userShare - claimed : 0;
+        uint256 claimed = yieldClaimed[user];
+        return accumulated > claimed ? accumulated - claimed : 0;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -508,6 +611,7 @@ contract ProtocolProtectionLayerV2 is Ownable2Step, ReentrancyGuard, Pausable {
     /// @param amount Amount to withdraw
     /// @param to Recipient address
     /// @dev In production, this function should be called via a timelock/multisig contract.
+    /// @dev [PPL-FIX-08] Withdraw to contract first, verify received, then transfer.
     function withdrawTreasury(uint256 amount, address to) external onlyOwner nonReentrant {
         if (to == address(0)) revert InvalidAddress();
         if (amount > treasuryBalance) revert InsufficientBalance();
@@ -515,9 +619,15 @@ contract ProtocolProtectionLayerV2 is Ownable2Step, ReentrancyGuard, Pausable {
 
         treasuryBalance -= amount;
 
-        IPool(AAVE_POOL).withdraw(DEPOSIT_TOKEN, amount, to);
+        // [PPL-FIX-08] Withdraw to contract, verify, then transfer
+        uint256 balanceBefore = IERC20(DEPOSIT_TOKEN).balanceOf(address(this));
+        IPool(AAVE_POOL).withdraw(DEPOSIT_TOKEN, amount, address(this));
+        uint256 received = IERC20(DEPOSIT_TOKEN).balanceOf(address(this)) - balanceBefore;
+        if (received < amount) revert InsufficientAaveLiquidity();
 
-        emit TreasuryWithdrawn(to, amount);
+        IERC20(DEPOSIT_TOKEN).safeTransfer(to, received);
+
+        emit TreasuryWithdrawn(to, received);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -682,7 +792,7 @@ contract ProtocolProtectionLayerV2 is Ownable2Step, ReentrancyGuard, Pausable {
     }
 
     /// @notice End compensation period, return unclaimed to seed
-    function endCompensationPeriod() external onlyOwner recordActivity {
+    function endCompensationPeriod() external onlyOwner nonReentrant recordActivity {  // [PPL-FIX-07]
         if (!compensationActive) revert NoActiveCompensation();
         if (block.timestamp < lastCompensationTimestamp + MIN_COMPENSATION_WINDOW) {
             revert CompensationWindowNotElapsed();
@@ -694,9 +804,8 @@ contract ProtocolProtectionLayerV2 is Ownable2Step, ReentrancyGuard, Pausable {
         
         // Return unclaimed to seed (re-supply to Aave)
         if (unclaimed > 0) {
-            IERC20(DEPOSIT_TOKEN).forceApprove(AAVE_POOL, unclaimed);
+            // [PPL-FIX-03] No per-operation approval needed. Constructor sets max.
             IPool(AAVE_POOL).supply(DEPOSIT_TOKEN, unclaimed, address(this), 0);
-            IERC20(DEPOSIT_TOKEN).forceApprove(AAVE_POOL, 0);
             seedBalance += unclaimed;
         }
         
@@ -713,9 +822,11 @@ contract ProtocolProtectionLayerV2 is Ownable2Step, ReentrancyGuard, Pausable {
         return block.timestamp > lastActivityTimestamp + DORMANCY_THRESHOLD;
     }
 
-    function activateDormancy() external {
+    function activateDormancy() external nonReentrant {  // [PPL-FIX-07]
         if (!isDormant()) revert NotDormant();
         if (dormancyActivated) return;
+        // [PPL-FIX-04] Cannot activate dormancy while compensation claims are pending
+        if (compensationActive) revert CompensationInProgress();
         
         dormancyActivated = true;
         
@@ -736,6 +847,8 @@ contract ProtocolProtectionLayerV2 is Ownable2Step, ReentrancyGuard, Pausable {
 
     function dormancyWithdraw() external nonReentrant {
         if (!dormancyActivated) revert DormancyNotActivated();
+        // [PPL-FIX-04] Defence in depth: block withdrawal if compensation somehow still active
+        if (compensationActive) revert CompensationInProgress();
         
         uint256 principal = userPrincipal[msg.sender];
         if (principal == 0) revert NoBalance();
@@ -770,14 +883,18 @@ contract ProtocolProtectionLayerV2 is Ownable2Step, ReentrancyGuard, Pausable {
                          ADMIN: CONFIG
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Update yield split (must total 100%)
+    /// @notice Update yield split (must total 100%, with minimums enforced)
     /// @dev In production, this function should be called via a timelock/multisig contract.
+    /// @dev [PPL-FIX-06] Minimums: user >= 50%, seed >= 5%. Prevents owner from
+    ///      zeroing out user yield or eliminating protection entirely.
     function updateYieldSplit(
         uint256 _userBps,
         uint256 _seedBps,
         uint256 _treasuryBps
     ) external onlyOwner {
         if (_userBps + _seedBps + _treasuryBps != BPS_DENOMINATOR) revert SplitMustEqual100();
+        if (_userBps < MIN_USER_YIELD_BPS) revert ConfigOutOfRange();
+        if (_seedBps < MIN_SEED_YIELD_BPS) revert ConfigOutOfRange();
         
         userYieldBps = _userBps;
         seedYieldBps = _seedBps;
@@ -840,7 +957,8 @@ contract ProtocolProtectionLayerV2 is Ownable2Step, ReentrancyGuard, Pausable {
         _treasuryBalance = treasuryBalance;
         _aTokenBalance = IERC20(A_TOKEN).balanceOf(address(this));
         
-        uint256 allocated = totalPrincipal + seedBalance + treasuryBalance;
+        // [PPL-FIX-02] Include totalUserYieldAccrued in allocated
+        uint256 allocated = totalPrincipal + seedBalance + treasuryBalance + totalUserYieldAccrued;
         _pendingYield = _aTokenBalance > allocated ? _aTokenBalance - allocated : 0;
         
         _compensationActive = compensationActive;
